@@ -4,3 +4,8 @@ install/
 log/
 __pycache__/
 .vscode/
+build/
+install/
+log/
+.vscode/
+__pycache__/
