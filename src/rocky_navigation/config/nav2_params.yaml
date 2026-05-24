@@ -1,0 +1,467 @@
+
+
+# ---------------------------------------------------------------------------
+#  Virtual Wall Node
+# ---------------------------------------------------------------------------
+virtual_wall_node:
+  ros__parameters:
+    use_sim_time:     True
+    camera_frame:     camera_link_optical
+    output_frame:     odom      # [FIX-6] publish in odom — eliminates costmap TF lookup failure
+    fx:               205.5
+    fy:               205.5
+    cx:               320.0
+    cy:               240.0
+
+    # [FIX-5]
+    depth_min:        0.5      # was 3.0 — near walls were invisible
+    depth_max:        4.0      # was 6.0 — far curve markings flooded costmap
+
+    ground_y_min:     0.01
+    ground_y_max:     0.25
+    lateral_x_max:    1.2      # clips lateral outliers on curves
+    pixel_stride:     8        # [FIX-7] was 2 (~3300 pts/frame) → 8 (~200 pts) stops blob clusters
+
+    # HSV — white lane
+    white_h_min:      0
+    white_h_max:      180
+    white_s_min:      0
+    white_s_max:      55
+    white_v_min:      195
+    white_v_max:      255
+
+    # HSV — yellow lane
+    yellow_h_min:     18
+    yellow_h_max:     35
+    yellow_s_min:     80
+    yellow_s_max:     255
+    yellow_v_min:     100
+    yellow_v_max:     255
+
+    publish_split_walls: True
+    show_debug:       False
+    sync_queue_size:  5
+    sync_slop:        0.5
+
+# ---------------------------------------------------------------------------
+#  Lane Follower Node
+# ---------------------------------------------------------------------------
+lane_follower_node:
+  ros__parameters:
+    use_sim_time:          True
+    lookahead_distance:    1.5
+    lookahead_step:        0.5
+    slice_tolerance:       0.25
+    min_remaining_dist:    0.4
+    startup_delay_sec:     0.0
+    nav_goal_timeout:      30.0
+    abort_cooldown_sec:    2.0
+    lane_width:            0.75
+    curve_detect_thresh:   0.12
+    curve_lookahead:       0.8
+    goal_update_dist:      0.30   # only replace goal if it shifts > 0.30 m
+
+# =============================================================================
+#  LOCAL COSTMAP
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time:             True
+      global_frame:             odom
+      robot_base_frame:         base_footprint
+      update_frequency:         10.0
+      publish_frequency:        10.0    # [DBG-3] was 5.0
+      always_send_full_costmap: true    # [DBG-2] full grid to RViz every cycle
+      rolling_window:           true
+      width:                    10
+      height:                   10
+      resolution:               0.05
+      robot_radius:             0.20
+      transform_tolerance:      2.0
+
+      plugins:
+        - obstacle_layer    # real LIDAR obstacles
+        - lane_layer        # camera virtual walls
+        - inflation_layer
+
+      # ---- Real obstacles (LIDAR) ----------------------------------------
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          obstacle_max_range:  8.0
+          obstacle_min_range:  0.0
+          raytrace_max_range:  8.5
+          raytrace_min_range:  0.0
+
+      # ---- Lane walls (camera virtual walls) — LOCAL: clearing ON ---------
+      lane_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: virtual_walls
+        virtual_walls:
+          topic: /virtual_walls
+          data_type: "PointCloud2"
+          min_obstacle_height: -5.0
+          max_obstacle_height:  5.0
+          obstacle_max_range:   5.0
+          obstacle_min_range:   0.0
+          raytrace_max_range:   5.5
+          raytrace_min_range:   0.0
+          clearing: True        # [FIX-2] LOCAL: always refresh from live camera
+          marking: True
+          expected_update_rate: 5.0
+
+      # ---- Inflation [DBG-1] — raised for RViz debug ----------------------
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.20   # [DBG-1] was 0.07 — raised for RViz visibility
+
+  local_costmap_client:
+    ros__parameters:
+      use_sim_time: True
+  local_costmap_rclcpp_node:
+    ros__parameters:
+      use_sim_time: True
+
+# =============================================================================
+#  GLOBAL COSTMAP
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time:         True
+      global_frame:         map
+      robot_base_frame:     base_footprint
+      update_frequency:     2.0
+      publish_frequency:    1.0
+      rolling_window:       true
+      width:                20
+      height:               20
+      resolution:           0.05
+      robot_radius:         0.20
+      transform_tolerance:  1.0
+      always_send_full_costmap: true
+
+      plugins:
+        - obstacle_layer
+        - lane_layer
+        - inflation_layer
+
+      # ---- Real obstacles (LIDAR) ----------------------------------------
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          obstacle_max_range:  8.0
+          obstacle_min_range:  0.0
+          raytrace_max_range:  8.5
+          raytrace_min_range:  0.0
+
+      # ---- Lane walls (camera virtual walls) — GLOBAL: clearing OFF -------
+      # [FIX-1] These walls NEVER clear. They accumulate as the robot drives,
+      # building a permanent lane corridor. NavFn is physically unable to
+      # plan a path that exits the lane.
+      lane_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: virtual_walls
+        virtual_walls:
+          topic: /virtual_walls
+          data_type: "PointCloud2"
+          min_obstacle_height: -5.0
+          max_obstacle_height:  5.0
+          obstacle_max_range:   5.0
+          obstacle_min_range:   0.0
+          raytrace_max_range:   5.5
+          raytrace_min_range:   0.0
+          clearing: False       # [FIX-1] GLOBAL: walls persist — no clearing ever
+          marking: True
+          expected_update_rate: 5.0
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.07   # global unchanged — production value
+
+# =============================================================================
+#  CONTROLLER SERVER  (DWB)
+# =============================================================================
+controller_server:
+  ros__parameters:
+    use_sim_time:                  True
+    controller_frequency:          10.0
+    min_x_velocity_threshold:      0.001
+    min_y_velocity_threshold:      0.001
+    min_theta_velocity_threshold:  0.001
+    failure_tolerance:             0.3
+    progress_checker_plugin:       "progress_checker"
+    goal_checker_plugins:          ["goal_checker"]
+    controller_plugins:            ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.05
+      movement_time_allowance:  35.0
+
+    goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance:  0.25
+      yaw_goal_tolerance: 0.25
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: True
+
+      min_vel_x:       0.0
+      min_vel_y:       0.0
+      max_vel_x:       0.22
+      max_vel_y:       0.0
+      max_vel_theta:   1.8
+      min_speed_xy:    0.0
+      max_speed_xy:    0.35
+      min_speed_theta: 0.0
+      acc_lim_x:       1.0
+      acc_lim_theta:   3.2
+      decel_lim_x:    -2.5
+      decel_lim_theta: -3.2
+
+      vx_samples:           20
+      vy_samples:           0
+      vtheta_samples:       40
+      sim_time:             3.0
+      linear_granularity:   0.05
+      angular_granularity:  0.025
+      transform_tolerance:  0.3
+      xy_goal_tolerance:    0.25
+      trans_stopped_velocity: 0.25
+
+      critics:
+        - "RotateToGoalCritic"
+        - "OscillationCritic"
+        - "BaseObstacleCritic"
+        - "GoalAlignCritic"
+        - "PathAlignCritic"
+        - "PathDistCritic"
+        - "GoalDistCritic"
+
+      BaseObstacleCritic:
+        plugin: "dwb_critics::BaseObstacleCritic"
+        scale: 12.0
+        sum_scores: false
+
+      GoalAlignCritic:
+        plugin: "dwb_critics::GoalAlignCritic"
+        scale: 20.0
+        forward_point_distance: 0.1
+        stopped_rot_tolerance:  0.1
+
+      PathAlignCritic:
+        plugin: "dwb_critics::PathAlignCritic"
+        scale: 24.0
+        forward_point_distance: 0.1
+
+      PathDistCritic:
+        plugin: "dwb_critics::PathDistCritic"
+        scale: 24.0
+
+      GoalDistCritic:
+        plugin: "dwb_critics::GoalDistCritic"
+        scale: 20.0
+
+      RotateToGoalCritic:
+        plugin: "dwb_critics::RotateToGoalCritic"
+        scale: 32.0
+        slowing_factor: 5.0
+        lookahead_time: -1.0
+
+      OscillationCritic:
+        plugin: "dwb_critics::OscillationCritic"
+        scale: 1.0
+        oscillation_reset_dist:  0.05
+        oscillation_reset_angle: 0.2
+
+  controller_server_rclcpp_node:
+    ros__parameters:
+      use_sim_time: True
+
+# =============================================================================
+#  PLANNER SERVER
+# =============================================================================
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 10.0
+    use_sim_time: True
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance:     0.25        # [FIX-4] was 0.5
+      use_astar:     true
+      allow_unknown: false       # [FIX-3]
+
+  planner_server_rclcpp_node:
+    ros__parameters:
+      use_sim_time: True
+
+# =============================================================================
+#  SMOOTHER SERVER
+# =============================================================================
+smoother_server:
+  ros__parameters:
+    use_sim_time: True
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance:     1.0e-10
+      max_its:       1000
+      do_refinement: True
+
+# =============================================================================
+#  BEHAVIOR SERVER
+# =============================================================================
+behavior_server:
+  ros__parameters:
+    use_sim_time:       True
+    local_frame:        odom
+    global_frame:       map
+    robot_base_frame:   base_footprint
+    transform_tolerance: 0.1
+    behavior_plugins:
+      - "spin"
+      - "backup"
+      - "drive_on_heading"
+      - "wait"
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+
+# =============================================================================
+#  BT NAVIGATOR
+# =============================================================================
+bt_navigator:
+  ros__parameters:
+    use_sim_time:       True
+    global_frame:       map
+    local_frame:        odom
+    robot_base_frame:   base_footprint
+    transform_tolerance: 0.1
+    default_nav_to_pose_bt_xml:       ""
+    default_nav_through_poses_bt_xml: ""
+    goal_blackboard_id:  goal
+    goals_blackboard_id: goals
+    path_blackboard_id:  path
+    navigators:
+      - "navigate_to_pose"
+      - "navigate_through_poses"
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator/NavigateToPoseNavigator"
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator/NavigateThroughPosesNavigator"
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_selector_bt_node
+
+  bt_navigator_navigate_through_poses_rclcpp_node:
+    ros__parameters:
+      use_sim_time: True
+  bt_navigator_navigate_to_pose_rclcpp_node:
+    ros__parameters:
+      use_sim_time: True
+
+# =============================================================================
+#  WAYPOINT FOLLOWER
+# =============================================================================
+waypoint_follower:
+  ros__parameters:
+    use_sim_time:  True
+    loop_rate:     20
+    stop_on_failure: false
+    action_server_result_timeout: 900.0
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200
+
+# =============================================================================
+#  VELOCITY SMOOTHER
+# =============================================================================
+velocity_smoother:
+  ros__parameters:
+    use_sim_time:        True
+    smoothing_frequency: 20.0
+    scale_velocities:    false
+    feedback:            "OPEN_LOOP"
+    max_velocity:        [0.35, 0.0, 1.0]
+    min_velocity:        [-0.35, 0.0, -1.0]
+    max_accel:           [2.0, 0.0, 3.0]
+    max_decel:           [-2.5, 0.0, -3.2]
+    odom_topic:          "odom"
+    odom_duration:       0.1
+    deadband_velocity:   [0.0, 0.0, 0.0]
+    velocity_timeout:    1.0
+
+# =============================================================================
+#  LIFECYCLE MANAGER
+# =============================================================================
+lifecycle_manager:
+  ros__parameters:
+    use_sim_time: True
+    autostart:    True
+    node_names:
+      - controller_server
+      - smoother_server
+      - planner_server
+      - behavior_server
+      - bt_navigator
+      - waypoint_follower
+      - velocity_smoother

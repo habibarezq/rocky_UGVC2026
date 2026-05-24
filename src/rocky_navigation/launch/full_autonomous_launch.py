@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+
+import os
+import yaml
+import tempfile
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    LogInfo,
+    TimerAction,
+)
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+
+    rocky_nav_dir = get_package_share_directory('rocky_navigation')
+    nav2_bringup  = get_package_share_directory('nav2_bringup')
+
+    # ------------------------------------------------------------------ #
+    #  BT XML paths                                                        #
+    # ------------------------------------------------------------------ #
+    bt_pose_xml  = os.path.join(
+        rocky_nav_dir, 'behavior_trees', 'navigate_to_pose.xml')
+    bt_poses_xml = os.path.join(
+        rocky_nav_dir, 'behavior_trees', 'navigate_through_poses.xml')
+
+    for f in (bt_pose_xml, bt_poses_xml):
+        if not os.path.isfile(f):
+            raise RuntimeError(
+                f'BT XML missing — did you colcon build?\n  {f}'
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Patch nav2_params.yaml — inject BT XML paths                       #
+    # ------------------------------------------------------------------ #
+    src_params = os.path.join(rocky_nav_dir, 'config', 'nav2_params.yaml')
+    with open(src_params, 'r') as fh:
+        params = yaml.safe_load(fh)
+
+    params['bt_navigator']['ros__parameters']['default_nav_to_pose_bt_xml']      = bt_pose_xml
+    params['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'] = bt_poses_xml
+
+    patched = tempfile.NamedTemporaryFile(
+        mode='w', prefix='nav2_params_patched_', suffix='.yaml', delete=False)
+    yaml.dump(params, patched)
+    patched.close()
+    patched_params = patched.name
+
+    # ------------------------------------------------------------------ #
+    #  Launch arguments                                                   #
+    # ------------------------------------------------------------------ #
+    declare_use_sim_time = DeclareLaunchArgument(
+        'use_sim_time', default_value='true',
+        description='Use /clock (Gazebo) or wall clock')
+
+    declare_slam_params = DeclareLaunchArgument(
+            'slam_params_file',
+            default_value=os.path.join(
+                get_package_share_directory('rocky_localization'), 'config', 'online_async.yaml'),
+            description='Path to SLAM Toolbox parameter file')
+
+    # ------------------------------------------------------------------ #
+    # ---> CHANGED DEFAULT VALUE TO 'true' HERE <---
+    # ------------------------------------------------------------------ #
+    declare_use_rviz = DeclareLaunchArgument(
+        'use_rviz', default_value='true',
+        description='Launch RViz2')
+
+    declare_rviz_config = DeclareLaunchArgument(
+        'rviz_config',
+        default_value=os.path.join(
+            rocky_nav_dir, 'rviz', 'nav2_default.rviz'),
+        description='RViz configuration file')
+
+    declare_log_level = DeclareLaunchArgument(
+        'log_level', default_value='info')
+
+    declare_lookahead = DeclareLaunchArgument(
+        'lookahead_distance', default_value='2.5',
+        description='Metres ahead of robot to place each lane-following goal')
+
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    use_rviz     = LaunchConfiguration('use_rviz')
+    rviz_config  = LaunchConfiguration('rviz_config')
+    log_level    = LaunchConfiguration('log_level')
+
+    # ------------------------------------------------------------------ #
+    #  Localization (EKF + IMU republisher)                               #
+    # ------------------------------------------------------------------ #
+    localization = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([os.path.join(
+            get_package_share_directory('rocky_localization'),
+            'launch', 'local_localization.launch.py',
+        )])
+    )
+
+    # ------------------------------------------------------------------ #
+    #  Nav2 stack                                                          #
+    # ------------------------------------------------------------------ #
+    nav2_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(nav2_bringup, 'launch', 'navigation_launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'params_file':  patched_params,
+            'autostart':    'true',
+        }.items(),
+    )
+
+    # ------------------------------------------------------------------ #
+    #  Virtual Wall Node (t +3 s)                                         #
+    # ------------------------------------------------------------------ #
+    virtual_wall_node = TimerAction(
+        period=3.0,
+        actions=[
+            Node(
+                package='rocky_perception',
+                executable='lane_filter_node',
+                name='lane_filter_node',
+                output='screen',
+                parameters=[src_params],
+                arguments=['--ros-args', '--log-level', log_level],
+                remappings=[
+                    ('/camera/image_raw',       '/camera/image_raw'),
+                    ('/camera/depth/image_raw', '/camera/depth/image_raw'),
+                    ('/virtual_walls',          '/virtual_walls'),
+                ],
+            )
+        ],
+    )
+
+    # ------------------------------------------------------------------ #
+    #  Lane Follower Node (t +10 s)                                       #
+    # ------------------------------------------------------------------ #
+    lane_follower = TimerAction(
+        period=10.0,
+        actions=[
+            Node(
+                package='rocky_perception',
+                executable='lane_follower_node',
+                name='lane_follower_node',
+                output='screen',
+                parameters=[{
+                    'use_sim_time':       use_sim_time,
+                    'lookahead_distance': LaunchConfiguration('lookahead_distance'),
+                    'min_remaining_dist': 0.8,
+                    'startup_delay_sec':  0.0,
+                    'nav_goal_timeout':   25.0,
+                }],
+                arguments=['--ros-args', '--log-level', log_level],
+            )
+        ],
+    )
+
+    # ------------------------------------------------------------------ #
+    #  RViz2 (optional)                                                   #
+    # ------------------------------------------------------------------ #
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config],
+        parameters=[{'use_sim_time': use_sim_time}],
+        output='screen',
+        condition=IfCondition(use_rviz),
+    )
+
+    # ------------------------------------------------------------------ #
+    #  cmd_vel relay                                                       #
+    # ------------------------------------------------------------------ #
+    relay_node = Node(
+        package='topic_tools',
+        executable='relay',
+        name='cmd_vel_relay',
+        arguments=['/cmd_vel', '/diff_drive_controller/cmd_vel_unstamped'],
+        output='screen',
+    )
+
+    # ------------------------------------------------------------------ #
+    #  Startup banner                                                      #
+    # ------------------------------------------------------------------ #
+    startup_msg = LogInfo(
+        msg=[
+            '\n',
+            '╔══════════════════════════════════════════════════╗\n',
+            '║   Rocky — Lane-Aware Autonomous Navigation        ║\n',
+            '║   SLAM Toolbox + Nav2 + Virtual Walls             ║\n',
+            '║   Lane follower: continuous forward goals         ║\n',
+            '╚══════════════════════════════════════════════════╝\n',
+            f'BT XML (pose)  = {bt_pose_xml}\n',
+            f'BT XML (poses) = {bt_poses_xml}\n',
+            f'Patched params = {patched_params}\n',
+            'use_sim_time   = ', use_sim_time, '\n',
+            'use_rviz       = ', use_rviz, '\n',
+            'Lane follower starts at t +10 s (SLAM warm-up delay)\n',
+            'Press Ctrl-C to stop the robot.\n',
+        ]
+    )
+
+    return LaunchDescription([
+        declare_use_sim_time,
+        declare_slam_params,
+        declare_use_rviz,
+        declare_rviz_config,
+        declare_log_level,
+        declare_lookahead,
+        startup_msg,
+        localization,
+        nav2_launch,
+        virtual_wall_node,
+        lane_follower,
+        rviz_node,
+        relay_node,
+    ])
