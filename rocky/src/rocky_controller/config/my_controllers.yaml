@@ -22,7 +22,8 @@ diff_drive_controller:
     base_frame_id: base_footprint
     publish_rate: 30.0
     odom_topic: odom # <-- added this line to match nav2_params.yaml
-
+    publish_odom_to_tf: true   
+    
     # Booleans
     enable_odom_tf: true
     use_stamped_vel: true

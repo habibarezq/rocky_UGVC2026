@@ -28,20 +28,32 @@ def generate_launch_description():
             'on_exit_shutdown': 'true'
         }.items()
     )
+    clock_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='clock_bridge',
+        arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
+        parameters=[{'use_sim_time': False}],  # ← False here, it IS the clock source
+        output='screen'
+    )
 
-    # ✅ ROS-GZ bridge is required — gz_sim.launch.py does NOT start it
     ros_gz_bridge = Node(
-    package='ros_gz_bridge',
-    executable='parameter_bridge',
-     arguments=[
-        '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
-        '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',  # ADD THIS
-        '/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',               # ADD THIS too
-    ],
-    parameters=[{'use_sim_time': True}],  # ADD THIS
-    output='screen'
-)
-
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='sensor_bridge',
+        arguments=[
+            '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
+            '/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
+            '/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+            '/tf_static@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+            '/scan/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
+        ],
+        parameters=[{
+            'use_sim_time': True,
+            'qos_overrides./tf_static.publisher.durability': 'transient_local',
+        }],
+        output='screen'
+    )
 
     spawn_entity = Node(
     package='ros_gz_sim',
@@ -86,6 +98,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        clock_bridge,
         gazebo,
         ros_gz_bridge,   # bridge must be running before spawn
         delayed_rsp,

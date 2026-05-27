@@ -13,6 +13,9 @@ find_package(ament_cmake REQUIRED)
 install(DIRECTORY config launch behavior_trees
   DESTINATION share/${PROJECT_NAME}
 )
+install(DIRECTORY rviz 
+  DESTINATION share/${PROJECT_NAME}
+)
 
 
 if(BUILD_TESTING)
