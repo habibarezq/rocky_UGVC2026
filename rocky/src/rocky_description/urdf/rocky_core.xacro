@@ -19,23 +19,23 @@
     <xacro:property name="caster_wheel_offset_x" value="0.075"/>
     <xacro:property name="caster_wheel_offset_z" value="${wheel_offset_z - wheel_radius + caster_wheel_radius}"/>
 
-    <material name="white">
+    <material name="rocky_white">
         <color rgba="1 1 1 1" />
     </material>
 
-    <material name="orange">
+    <material name="rocky_orange">
         <color rgba="1 0.3 0.1 1"/>
     </material>
 
-    <material name="blue">
+    <material name="rocky_blue">
         <color rgba="0.2 0.2 1 1"/>
     </material>
 
-    <material name="black">
+    <material name="rocky_black">
         <color rgba="0 0 0 1"/>
     </material>
 
-    <material name="red">
+    <material name="rocky_red">
         <color rgba="1 0 0 1"/>
     </material>
 
@@ -47,12 +47,16 @@
 
     <!-- BASE_FOOTPRINT LINK -->
 
-    <joint name="base_footprint_joint" type="fixed">
+    <!-- <joint name="base_footprint_joint" type="fixed">
             <parent link="base_footprint"/>
             <child link="base_link"/>
             <origin xyz="0 0 0" rpy="0 0 0"/>
-        </joint>
-
+        </joint> -->
+<joint name="base_footprint_joint" type="fixed">
+        <parent link="base_footprint"/>
+        <child link="base_link"/>
+        <origin xyz="0 0 0.033" rpy="0 0 0"/> 
+    </joint>
     <link name="base_footprint">
     </link>
 
@@ -71,7 +75,7 @@
             <geometry>
                 <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
             </geometry>
-            <material name="orange"/>
+            <material name="rocky_orange"/>
         </visual>
         <collision>
             <origin xyz="${chassis_length/2} 0 ${chassis_height/2}"/>
@@ -102,11 +106,11 @@
             <geometry>
                 <cylinder radius="${wheel_radius}" length="${wheel_thickness}"/>
             </geometry>
-            <material name="blue"/>
+            <material name="rocky_blue"/>
         </visual>
         <collision>
             <geometry>
-                <sphere radius="${wheel_radius}"/>
+                <cylinder radius="${wheel_radius}" length="${wheel_thickness}"/>
             </geometry>
         </collision>
         <xacro:inertial_cylinder mass="${wheel_mass}" length="${wheel_thickness}" radius="${wheel_radius}">
@@ -116,6 +120,8 @@
 
     <gazebo reference="left_wheel">
         <material>Gazebo/Blue</material>
+     <mu1>1.0</mu1>
+<mu2>1.0</mu2>
     </gazebo>
 
 
@@ -135,11 +141,11 @@
             <geometry>
                 <cylinder radius="${wheel_radius}" length="${wheel_thickness}"/>
             </geometry>
-            <material name="blue"/>
+            <material name="rocky_blue"/>
         </visual>
         <collision>
             <geometry>
-                <sphere radius="${wheel_radius}"/>
+                <sphere radius="${wheel_radius}" length="${wheel_thickness}"/>
             </geometry>
         </collision>
         <xacro:inertial_cylinder mass="${wheel_mass}" length="${wheel_thickness}" radius="${wheel_radius}">
@@ -149,6 +155,8 @@
 
     <gazebo reference="right_wheel">
         <material>Gazebo/Blue</material>
+       <mu1>1.0</mu1>
+<mu2>1.0</mu2>
     </gazebo>
 
 
@@ -166,11 +174,11 @@
             <geometry>
                 <sphere radius="${caster_wheel_radius}"/>
             </geometry>
-            <material name="white"/>
+            <material name="rocky_white"/>
         </visual>
         <collision>
             <geometry>
-                <sphere radius="${caster_wheel_radius}"/>
+                <sphere radius="${caster_wheel_radius}" value="0.015"/>
             </geometry>
         </collision>
         <xacro:inertial_sphere mass="${caster_wheel_mass}" radius="${caster_wheel_radius}">
@@ -178,10 +186,9 @@
         </xacro:inertial_sphere>
     </link>
 
-    <gazebo reference="caster_wheel">
+  <gazebo reference="caster_wheel">
         <material>Gazebo/White</material>
-        <mu1 value="0.001"/>
-        <mu2 value="0.001"/>
+        <mu1>0.00001</mu1>
+        <mu2>0.00001</mu2>
     </gazebo>
-
 </robot>

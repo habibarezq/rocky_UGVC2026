@@ -15,6 +15,7 @@ install(
   PROGRAMS  
           ${PROJECT_NAME}/imu_republisher.py
   DESTINATION lib/${PROJECT_NAME}
+  RENAME imu_republisher
 )
 
 

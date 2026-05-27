@@ -12,7 +12,7 @@
             <geometry>
                 <box size="0.010 0.03 0.03"/>
             </geometry>
-            <material name="red"/>
+            <material name="rocky_red"/>
         </visual>
     </link>
 
@@ -46,9 +46,13 @@
                     <far>8.0</far>
                 </clip>
             </camera>
-            <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
+            <!-- <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
                 <frame_name>camera_link_optical</frame_name>
-            </plugin>
+            </plugin> -->
+            <!-- <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+            <render_engine>ogre2</render_engine>
+            </plugin> -->
+<!-- topic is set via <topic> tag on the <sensor> element -->
         </sensor>
     </gazebo>
 

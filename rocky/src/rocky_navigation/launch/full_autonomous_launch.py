@@ -176,14 +176,20 @@ def generate_launch_description():
     # ------------------------------------------------------------------ #
     #  cmd_vel relay                                                       #
     # ------------------------------------------------------------------ #
-    relay_node = Node(
-        package='topic_tools',
-        executable='relay',
-        name='cmd_vel_relay',
-        arguments=['/cmd_vel', '/diff_drive_controller/cmd_vel_unstamped'],
-        output='screen',
-    )
-
+    # relay_node = Node(
+    #     package='topic_tools',
+    #     executable='relay',
+    #     name='cmd_vel_relay',
+    #     arguments=['/cmd_vel', '/diff_drive_controller/cmd_vel_unstamped'],
+    #     output='screen',
+    # )
+    twist_stamper = Node(
+            package='rocky_controller',
+            executable='twist_stamper',
+            name='twist_stamper',
+            parameters=[{'use_sim_time': use_sim_time}],
+            output='screen',
+        )
     # ------------------------------------------------------------------ #
     #  Startup banner                                                      #
     # ------------------------------------------------------------------ #
@@ -218,5 +224,5 @@ def generate_launch_description():
         virtual_wall_node,
         lane_follower,
         rviz_node,
-        relay_node,
+        twist_stamper,
     ])

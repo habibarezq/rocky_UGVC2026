@@ -12,7 +12,7 @@
             <geometry>
                 <box size="0.02 0.02 0.02"/>
             </geometry>
-            <material name="black"/>
+            <material name="rocky_black"/>
         </visual>
     </link>
 
@@ -22,7 +22,9 @@
             <always_on>true</always_on>
             <update_rate>100</update_rate>
             <visualize>true</visualize>
-            
+            <topic>imu</topic>
+            <gz_frame_id>imu_link</gz_frame_id>
+
             <imu>
                 <angular_velocity>
                     <x>
@@ -66,12 +68,14 @@
                 </linear_acceleration>
             </imu>
 
-            <plugin filename="libgazebo_ros_imu_sensor.so" name="imu_plugin">
+            <!-- <plugin filename="libgazebo_ros_imu_sensor.so" name="imu_plugin">
                 <ros>
                     <remapping>~/out:=imu</remapping>
                 </ros>
                 <initial_orientation_as_reference>false</initial_orientation_as_reference>
-            </plugin>
+            </plugin> -->
+            <plugin filename="gz-sim-imu-system"
+            name="gz::sim::systems::Imu"/>
         </sensor>
     </gazebo>
 

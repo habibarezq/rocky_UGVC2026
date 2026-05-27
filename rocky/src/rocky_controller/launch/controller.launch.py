@@ -13,7 +13,7 @@ def launch_noisy_controller(context, *args, **kwargs):
     # Create the noisy_controller node with perturbed parameters
     noisy_controller_node = Node(
         package="rocky_controller", 
-        executable="noisy_controller.py",
+        executable="noisy_controller",
         parameters=[
             {"wheel_radius": wheel_radius + wheel_radius_error, 
              "wheel_separation": wheel_separation + wheel_separation_error}

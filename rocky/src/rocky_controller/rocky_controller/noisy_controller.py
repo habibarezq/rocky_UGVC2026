@@ -11,7 +11,6 @@ from geometry_msgs.msg import TransformStamped
 import math
 from tf_transformations import quaternion_from_euler
 
-
 class NoisyController(Node):
 
     def __init__(self):
