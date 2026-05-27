@@ -195,7 +195,7 @@
         </link>
       </model>
       
-      <model name='tunnel_obstacle'>
+      <!-- <model name='tunnel_obstacle'>
         <pose frame=''>-1.04145 -1.12671 0 0 -0 0</pose>
         <scale>1 1 1</scale>
         <link name='obstacle_1'>
@@ -216,9 +216,9 @@
           <acceleration>0 0 0 0 -0 0</acceleration>
           <wrench>0 0 0 0 -0 0</wrench>
         </link>
-      </model>
+      </model> -->
 
-      <model name='tunnel_wall'>
+      <!-- <model name='tunnel_wall'>
         <pose frame=''>-0.964699 -1.03574 0 0 -0 0</pose>
         <scale>1 1 1</scale>
         <link name='Wall_1'>
@@ -245,7 +245,7 @@
           <acceleration>0 0 0 0 -0 0</acceleration>
           <wrench>0 0 0 0 -0 0</wrench>
         </link>
-      </model>
+      </model> -->
 
       <model name='unit_box'>
         <pose frame=''>-1.72  0.56 0.12 0 0 -0.0 </pose>
@@ -313,7 +313,7 @@
       </camera>
     </gui>
 
-    <model name='tunnel_wall'>
+    <!-- <model name='tunnel_wall'>
       <link name='Wall_1'>
         <pose frame=''>-0.980783 0.049883 0 0 -0 1.5708</pose>
         <self_collide>0</self_collide>
@@ -641,9 +641,9 @@
       <static>1</static>
       <allow_auto_disable>1</allow_auto_disable>
       <pose frame=''>-0.964699 -1.03574 0 0 -0 0</pose>
-    </model>
+    </model> -->
 
-    <model name='tunnel_obstacle'>
+    <!-- <model name='tunnel_obstacle'>
       <link name='obstacle_1'>
         <pose frame=''>0.42322 -0.212034 0.0 0 -0 0</pose>
         <inertial>
@@ -935,7 +935,7 @@
       <static>1</static>
       <allow_auto_disable>1</allow_auto_disable>
       <pose frame=''>-1.04145 -1.12671 0 0 -0 0</pose>
-    </model>
+    </model> -->
 
     <model name='barrier_1'>
       <link name='link'>

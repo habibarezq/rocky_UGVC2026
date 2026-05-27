@@ -2,6 +2,7 @@ import os
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
+from launch.actions import ExecuteProcess, TimerAction
 
 def generate_launch_description():
 
@@ -34,8 +35,25 @@ def generate_launch_description():
         )]
     )
 
+    activate_slam_configure = TimerAction(
+        period=3.0,
+        actions=[ExecuteProcess(
+            cmd=['ros2', 'lifecycle', 'set', '/slam_toolbox', 'configure'],
+            output='screen'
+        )]
+    )
+
+    activate_slam_activate = TimerAction(
+        period=5.0,
+        actions=[ExecuteProcess(
+            cmd=['ros2', 'lifecycle', 'set', '/slam_toolbox', 'activate'],
+            output='screen'
+        )]
+    )
     return LaunchDescription([
         robot_localization_node,
         imu_republisher_node,
         slam_toolbox_node,
+        activate_slam_configure,
+        activate_slam_activate
     ])

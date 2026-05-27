@@ -41,14 +41,23 @@ def generate_launch_description():
         package='ros_gz_bridge',
         executable='parameter_bridge',
         name='sensor_bridge',
-        arguments=[
-            '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
-            '/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
-            '/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
-            '/tf_static@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
-            '/scan/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
+            arguments=[
+        '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
+        '/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
+        '/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+        '/tf_static@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+        '/scan/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
+        '/camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
+        '/camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
+        '/camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+        '/camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
+    ],
+        remappings=[
+            ('/camera/image', '/camera/image_raw'),
+            ('/camera/depth_image', '/camera/depth/image_raw'),
+            ('/camera/camera_info', '/camera/camera_info'),
         ],
-        parameters=[{
+            parameters=[{
             'use_sim_time': True,
             'qos_overrides./tf_static.publisher.durability': 'transient_local',
         }],

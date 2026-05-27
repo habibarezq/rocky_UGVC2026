@@ -23,6 +23,7 @@ Fixes in this version
 """
 
 import math
+import uuid
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -59,13 +60,13 @@ class LaneFollowerNode(Node):
         self.declare_parameter('lookahead_distance',  1.5)
         self.declare_parameter('lookahead_step',      0.5)
         self.declare_parameter('slice_tolerance',     0.25)
-        self.declare_parameter('min_remaining_dist',  0.4)
+        self.declare_parameter('min_remaining_dist',  0.7) # was 0.4
         self.declare_parameter('startup_delay_sec',   0.0)
         self.declare_parameter('nav_goal_timeout',    30.0)
         self.declare_parameter('abort_cooldown_sec',  2.0)
         self.declare_parameter('lane_width',          0.75)
-        self.declare_parameter('curve_detect_thresh', 0.12)
-        self.declare_parameter('curve_lookahead',     0.8)
+        self.declare_parameter('curve_detect_thresh', 0.08) # was 0.12
+        self.declare_parameter('curve_lookahead',     0.4) #was 0.8
         # Goal is only replaced when it shifts more than this (m)
         self.declare_parameter('goal_update_dist',    0.30)
 
@@ -108,6 +109,7 @@ class LaneFollowerNode(Node):
         # don't trigger the abort cooldown.
         # ---------------------------------------------------------------
         self._intentional_cancel = False
+        self._pending_goal_id = None
 
         # 0.5 s loop — slower than v2's 0.3 s to reduce preemption spam
         self._timer = self.create_timer(0.5, self._loop)
@@ -264,8 +266,9 @@ class LaneFollowerNode(Node):
         pose = PoseStamped()
         pose.header.frame_id   = 'map'
         pose.header.stamp      = self.get_clock().now().to_msg()
-        pose.pose.position.x   = x + self._curve_lookahead * math.cos(yaw)
-        pose.pose.position.y   = y + self._curve_lookahead * math.sin(yaw)
+        blind_dist = self._curve_lookahead * 0.4
+        pose.pose.position.x = x + blind_dist * math.cos(yaw)
+        pose.pose.position.y = y + blind_dist * math.sin(yaw)
         pose.pose.position.z   = 0.0
         pose.pose.orientation  = q
         return pose
@@ -308,22 +311,25 @@ class LaneFollowerNode(Node):
         self.get_logger().info(
             f'🎯 Vision Goal: ({pose.pose.position.x:.2f}, {pose.pose.position.y:.2f})')
 
+        self._pending_goal_id = str(uuid.uuid4())
         future = self._nav_client.send_goal_async(goal_msg)
-        future.add_done_callback(self._on_goal_accepted)
+        future.add_done_callback(
+    lambda f, gid=self._pending_goal_id: self._on_goal_accepted(f, gid))
         self._goal_active  = True
         self._current_goal = pose
         self._goal_sent_at = self.get_clock().now()
 
-    def _on_goal_accepted(self, future):
+    def _on_goal_accepted(self, future, goal_id):
         handle = future.result()
         if not handle.accepted:
             self.get_logger().warn('Goal rejected by Nav2.')
             self._goal_active = False
             return
         self._goal_handle = handle
-        handle.get_result_async().add_done_callback(self._on_result)
+        handle.get_result_async().add_done_callback(
+            lambda f: self._on_result(f, goal_id))
 
-    def _on_result(self, future):
+    def _on_result(self, future, goal_id):
         """
         Called when a goal finishes.
 
@@ -334,6 +340,8 @@ class LaneFollowerNode(Node):
         If _intentional_cancel is set we know we triggered the cancel — skip cooldown.
         Otherwise it is a genuine Nav2 failure (stuck, planner error) → cooldown.
         """
+        if goal_id != self._pending_goal_id:
+            return
         if self._intentional_cancel:
             # We cancelled it on purpose to send a new goal — not a failure
             self._intentional_cancel = False
@@ -361,7 +369,7 @@ class LaneFollowerNode(Node):
             self._intentional_cancel = True
             self._goal_handle.cancel_goal_async()
             self._goal_handle = None
-        self._goal_active = False
+        # self._goal_active = False
 
 
 # ---------------------------------------------------------------------------

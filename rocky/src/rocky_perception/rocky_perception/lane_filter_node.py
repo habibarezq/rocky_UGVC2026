@@ -63,7 +63,7 @@ class VirtualWallNode(Node):
         # Parameters
         # ------------------------------------------------------------------
         self.declare_parameter('camera_frame',       'camera_link_optical')
-        self.declare_parameter('fx',                 205.5)
+        self.declare_parameter('fx',                 205.5) #using the /camera/info topic to verify was 205.5
         self.declare_parameter('fy',                 205.5)
         self.declare_parameter('cx',                 320.0)
         self.declare_parameter('cy',                 240.0)
@@ -88,7 +88,7 @@ class VirtualWallNode(Node):
         self.declare_parameter('white_h_max',        180)
         self.declare_parameter('white_s_min',        0)
         self.declare_parameter('white_s_max',        55)
-        self.declare_parameter('white_v_min',        195)
+        self.declare_parameter('white_v_min',        190) # was 195
         self.declare_parameter('white_v_max',        255)
 
         # HSV — yellow lane
@@ -96,7 +96,7 @@ class VirtualWallNode(Node):
         self.declare_parameter('yellow_h_max',       35)
         self.declare_parameter('yellow_s_min',       80)
         self.declare_parameter('yellow_s_max',       255)
-        self.declare_parameter('yellow_v_min',       100)
+        self.declare_parameter('yellow_v_min',       85) # was 100
         self.declare_parameter('yellow_v_max',       255)
 
         # Diagnostics

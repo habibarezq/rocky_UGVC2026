@@ -104,20 +104,26 @@ def generate_launch_description():
         )])
     )
 
+
     # ------------------------------------------------------------------ #
     #  Nav2 stack                                                          #
     # ------------------------------------------------------------------ #
-    nav2_launch = IncludeLaunchDescription(
-    PythonLaunchDescriptionSource(
-        os.path.join(rocky_nav_dir, 'launch', 'nav2.launch.py')
-    ),
-    launch_arguments={
-        'use_sim_time': use_sim_time,
-        'params_file':  patched_params,
-        'autostart':    'true',
-        'slam': 'false',
-    }.items(),
-        )   
+    nav2_launch = TimerAction(
+    period=5.0,   # wait 10s for SLAM to init and publish map frame
+    actions=[
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(rocky_nav_dir, 'launch', 'nav2.launch.py')
+            ),
+            launch_arguments={
+                'use_sim_time': use_sim_time,
+                'params_file':  patched_params,
+                'autostart':    'true',
+                'slam': 'false',
+            }.items(),
+        )
+    ]
+)
 
     # ------------------------------------------------------------------ #
     #  Virtual Wall Node (t +3 s)                                         #
@@ -203,7 +209,7 @@ def generate_launch_description():
         declare_log_level,
         declare_lookahead,
         startup_msg,
-        localization,
+        # localization,
         nav2_launch,
         virtual_wall_node,
         lane_follower,
