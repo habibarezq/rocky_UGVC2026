@@ -21,8 +21,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
 
     rocky_nav_dir = get_package_share_directory('rocky_navigation')
-    nav2_bringup  = get_package_share_directory('nav2_bringup')
-
+    
     # ------------------------------------------------------------------ #
     #  BT XML paths                                                        #
     # ------------------------------------------------------------------ #
@@ -54,30 +53,21 @@ def generate_launch_description():
     patched_params = patched.name
 
     # ------------------------------------------------------------------ #
-    #  Launch arguments                                                   #
+    #  Launch arguments                                                    #
     # ------------------------------------------------------------------ #
     declare_use_sim_time = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
         description='Use /clock (Gazebo) or wall clock')
 
     declare_slam_params = DeclareLaunchArgument(
-            'slam_params_file',
-            default_value=os.path.join(
-                get_package_share_directory('rocky_localization'), 'config', 'online_async.yaml'),
-            description='Path to SLAM Toolbox parameter file')
+        'slam_params_file',
+        default_value=os.path.join(
+            get_package_share_directory('rocky_localization'), 'config', 'online_async.yaml'),
+        description='Path to SLAM Toolbox parameter file')
 
-    # ------------------------------------------------------------------ #
-    # ---> CHANGED DEFAULT VALUE TO 'true' HERE <---
-    # ------------------------------------------------------------------ #
     declare_use_rviz = DeclareLaunchArgument(
         'use_rviz', default_value='true',
         description='Launch RViz2')
-
-    declare_rviz_config = DeclareLaunchArgument(
-        'rviz_config',
-        default_value=os.path.join(
-            rocky_nav_dir, 'rviz', 'nav2_default.rviz'),
-        description='RViz configuration file')
 
     declare_log_level = DeclareLaunchArgument(
         'log_level', default_value='info')
@@ -88,8 +78,21 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     use_rviz     = LaunchConfiguration('use_rviz')
-    rviz_config  = LaunchConfiguration('rviz_config')
     log_level    = LaunchConfiguration('log_level')
+
+    # ------------------------------------------------------------------ #
+    #  RViz — reuse rviz.launch.py, point at nav2 config                  #
+    # ------------------------------------------------------------------ #
+    rviz = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(rocky_nav_dir, 'launch', 'rvizz.launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'rviz_config':  os.path.join(rocky_nav_dir, 'rviz', 'rocky_teleop.rviz'),
+        }.items(),
+        condition=IfCondition(use_rviz),
+    )
 
     # ------------------------------------------------------------------ #
     #  Localization (EKF + IMU republisher)                               #
@@ -105,15 +108,16 @@ def generate_launch_description():
     #  Nav2 stack                                                          #
     # ------------------------------------------------------------------ #
     nav2_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(nav2_bringup, 'launch', 'navigation_launch.py')
-        ),
-        launch_arguments={
-            'use_sim_time': use_sim_time,
-            'params_file':  patched_params,
-            'autostart':    'true',
-        }.items(),
-    )
+    PythonLaunchDescriptionSource(
+        os.path.join(rocky_nav_dir, 'launch', 'nav2.launch.py')
+    ),
+    launch_arguments={
+        'use_sim_time': use_sim_time,
+        'params_file':  patched_params,
+        'autostart':    'true',
+        'slam': 'false',
+    }.items(),
+        )   
 
     # ------------------------------------------------------------------ #
     #  Virtual Wall Node (t +3 s)                                         #
@@ -161,35 +165,16 @@ def generate_launch_description():
     )
 
     # ------------------------------------------------------------------ #
-    #  RViz2 (optional)                                                   #
+    #  twist_stamper                                                       #
     # ------------------------------------------------------------------ #
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        arguments=['-d', rviz_config],
+    twist_stamper = Node(
+        package='rocky_controller',
+        executable='twist_stamper',
+        name='twist_stamper',
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen',
-        condition=IfCondition(use_rviz),
     )
 
-    # ------------------------------------------------------------------ #
-    #  cmd_vel relay                                                       #
-    # ------------------------------------------------------------------ #
-    # relay_node = Node(
-    #     package='topic_tools',
-    #     executable='relay',
-    #     name='cmd_vel_relay',
-    #     arguments=['/cmd_vel', '/diff_drive_controller/cmd_vel_unstamped'],
-    #     output='screen',
-    # )
-    twist_stamper = Node(
-            package='rocky_controller',
-            executable='twist_stamper',
-            name='twist_stamper',
-            parameters=[{'use_sim_time': use_sim_time}],
-            output='screen',
-        )
     # ------------------------------------------------------------------ #
     #  Startup banner                                                      #
     # ------------------------------------------------------------------ #
@@ -213,9 +198,8 @@ def generate_launch_description():
 
     return LaunchDescription([
         declare_use_sim_time,
-        declare_slam_params,
+        # declare_slam_params,
         declare_use_rviz,
-        declare_rviz_config,
         declare_log_level,
         declare_lookahead,
         startup_msg,
@@ -223,6 +207,6 @@ def generate_launch_description():
         nav2_launch,
         virtual_wall_node,
         lane_follower,
-        rviz_node,
+        rviz,            # ← now uses shared rviz.launch.py
         twist_stamper,
     ])
