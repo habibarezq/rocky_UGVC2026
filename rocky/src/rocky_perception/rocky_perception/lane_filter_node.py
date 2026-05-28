@@ -1,297 +1,468 @@
 #!/usr/bin/env python3
-"""
-Lane Filter Node
-================
-Subscribes to a raw camera image, runs the RoadFeatureDetector pipeline,
-and publishes:
-  - /lane_points          (sensor_msgs/PointCloud2)  — ground-plane lane pixels
-  - /virtual_walls/left   (sensor_msgs/PointCloud2)  — left lane wall
-  - /virtual_walls/right  (sensor_msgs/PointCloud2)  — right lane wall
-  - /lane_circles         (sensor_msgs/PointCloud2)  — circle contour clouds
-  - /lane_image           (sensor_msgs/Image)        — annotated debug image
-  - /bev_image            (sensor_msgs/Image)        — bird's-eye-view image
-
-Camera intrinsics and extrinsics are loaded from ROS parameters so they can
-be overridden at launch without recompiling.
-
-Left / right wall splitting:
-  Lane points with X < -lane_half_width are published on /virtual_walls/left,
-  points with X >  lane_half_width on /virtual_walls/right, where X is the
-  lateral ground coordinate (positive = right of camera optical axis).
-"""
-
-import numpy as np
-import cv2
 import rclpy
 from rclpy.node import Node
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
-from sensor_msgs.msg import Image, PointCloud2, PointField
-from std_msgs.msg import Header
-import sensor_msgs_py.point_cloud2 as pc2
-from cv_bridge import CvBridge
-from road_features_detector import RoadFeatureDetector
+from rclpy.node import SetParametersResult
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+
+from sensor_msgs.msg import Image, PointCloud2, CameraInfo
+from std_msgs.msg import Header, String
+
+import numpy as np
+from cv_bridge import CvBridge, CvBridgeError
+
+# For point cloud conversion
+from sensor_msgs_py import point_cloud2
+
+# Import your custom modules
+from .cv_code.road_features_detector import RoadFeatureDetector
+from .cv_code.pipeline import RoadFeatureBEVPipeline
 
 
-# ---------------------------------------------------------------------------
-# Helper: numpy (N,3) → PointCloud2
-# ---------------------------------------------------------------------------
-def array_to_cloud(points: np.ndarray, frame_id: str, stamp) -> PointCloud2:
-    """Convert an (N, 3) float32/float64 array to a PointCloud2 message."""
-    header = Header()
-    header.frame_id = frame_id
-    header.stamp    = stamp
-
-    fields = [
-        PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
-        PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
-        PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
-    ]
-
-    pts = points.astype(np.float32)
-    cloud = pc2.create_cloud(header, fields, pts)
-    return cloud
-
-
-# ---------------------------------------------------------------------------
-# Node
-# ---------------------------------------------------------------------------
-class LaneFilterNode(Node):
+class RoadDetectorNode(Node):
+    """ROS2 node for detecting road features (lane markings and potholes) from camera images"""
 
     def __init__(self):
         super().__init__('lane_filter_node')
 
-        # ------------------------------------------------------------------
-        # Declare parameters (can be set in launch file or YAML config)
-        # ------------------------------------------------------------------
-        self._declare_params()
+        # Initialize bridge
+        self.bridge = CvBridge()
 
-        # ------------------------------------------------------------------
-        # Build detector from parameters
-        # ------------------------------------------------------------------
-        self._detector = self._build_detector()
+        # Declare parameters
+        self._declare_parameters()
 
-        # ------------------------------------------------------------------
-        # CV Bridge
-        # ------------------------------------------------------------------
-        self._bridge = CvBridge()
+        # Get parameters
+        self._load_parameters()
 
-        # ------------------------------------------------------------------
-        # Publishers
-        # ------------------------------------------------------------------
-        self._pub_lane      = self.create_publisher(PointCloud2, '/lane_points',         5)
-        self._pub_left      = self.create_publisher(PointCloud2, '/virtual_walls/left',  5)
-        self._pub_right     = self.create_publisher(PointCloud2, '/virtual_walls/right', 5)
-        self._pub_circles   = self.create_publisher(PointCloud2, '/lane_circles',        5)
-        self._pub_img       = self.create_publisher(Image,       '/lane_image',          5)
-        self._pub_bev       = self.create_publisher(Image,       '/bev_image',           5)
+        # Validate parameters
+        if not self._validate_parameters():
+            self.get_logger().error("Parameter validation failed - node will not function correctly")
 
-        # ------------------------------------------------------------------
-        # Subscriber
-        # ------------------------------------------------------------------
-        image_topic = self.get_parameter('image_topic').value
-        self._sub = self.create_subscription(
-            Image, image_topic, self._image_callback, 5)
+        # Initialize state variables
+        self.pipeline = None
+        self.image_size = (1920, 1080)  # Will be updated from first frame
+        self.latest_image = None
 
-        self.get_logger().info(
-            f'LaneFilterNode ready — subscribing to [{image_topic}]')
+        # Performance tracking
+        self.processing_times = []
+        self.frame_count = 0
 
-    # ----------------------------------------------------------------------
-    # Parameter declarations
-    # ----------------------------------------------------------------------
-    def _declare_params(self):
-        def dp(name, value, description=''):
-            descriptor = ParameterDescriptor(description=description)
-            self.declare_parameter(name, value, descriptor)
+        # Setup publishers, subscribers, and timers
+        self.setup_comms()
 
-        # Topics
-        dp('image_topic', '/camera/image_raw', 'Input image topic')
-        dp('camera_frame', 'camera_link_optical', 'Camera optical frame id')
+        # Add dynamic parameter callback
+        self.add_on_set_parameters_callback(self.parameters_callback)
 
-        # Intrinsics — flat list [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-        dp('K', [793.79768697, 0.0, 290.78702859,
-                 0.0, 813.96117996, 241.57106901,
-                 0.0, 0.0, 1.0],
-           'Camera intrinsic matrix (row-major, 9 values)')
+        self.get_logger().info("Road Detector Node Initialized Successfully")
+        self.get_logger().info(f"Debug images: {self.publish_debug_images}")
 
-        # Distortion — [k1, k2, p1, p2, k3]
-        dp('dist_coeffs',
-           [-4.97661814e-01, 8.05356640e+00, 9.44660547e-03,
-            -2.64434172e-02, -4.33974203e+01],
-           'Distortion coefficients [k1,k2,p1,p2,k3]')
+    def _declare_parameters(self):
+        """Declare all node parameters with default values"""
 
-        # Extrinsics
-        dp('camera_height', 1.33,   'Camera height above ground (m)')
-        dp('pitch_deg',    -45.0,   'Camera pitch angle (degrees, negative = down)')
-        dp('yaw_deg',       -2.0,   'Camera yaw angle (degrees)')
-        dp('roll_deg',      -7.0,   'Camera roll angle (degrees)')
+        # Topic parameters
+        self.declare_parameter('camera_topic', '/camera/image_raw')
+        self.declare_parameter('camera_info_topic', '/camera/camera_info')
+        self.declare_parameter('output_lane_mask_topic', '/road_detector/debug/lane_mask')
+        self.declare_parameter('output_bev_topic', '/road_detector/debug/bev_image')
+        self.declare_parameter('output_stats_topic', '/road_detector/stats')
 
-        # Image size — used to initialize homography; will be overridden
-        # on first frame if it does not match the incoming stream.
-        dp('image_width',   640, 'Expected image width  (pixels)')
-        dp('image_height',  480, 'Expected image height (pixels)')
+        # Camera parameters (extrinsic)
+        self.declare_parameter('camera_height', 1.43)
+        self.declare_parameter('pitch_deg', -50.0)
+        self.declare_parameter('yaw_deg', 0.0)
+        self.declare_parameter('roll_deg', 0.0)
+
+        # Camera parameters (intrinsic)
+        self.declare_parameter('fx', 1000.0)
+        self.declare_parameter('fy', 1000.0)
+        self.declare_parameter('cx', 960.0)
+        self.declare_parameter('cy', 540.0)
+        self.declare_parameter('dist_coeffs', [0.0, 0.0, 0.0, 0.0, 0.0])
+
+        # Detection parameters
+        self.declare_parameter('min_radius', 10)
+        self.declare_parameter('max_radius', 200)
 
         # Lane geometry
-        dp('lane_half_width', 0.375,
-           'Half-width of lane (m). Points |X| > this split L/R wall.')
+        self.declare_parameter('lane_half_width', 0.375)
 
-        # Detection limits
-        dp('min_circle_radius', 10,  'Min circle radius in pixels')
-        dp('max_circle_radius', 200, 'Max circle radius in pixels')
+        # Debug parameters
+        self.declare_parameter('publish_debug_images', False)
+        self.declare_parameter('publish_performance_stats', False)
 
-    # ----------------------------------------------------------------------
-    # Build detector
-    # ----------------------------------------------------------------------
-    def _build_detector(self) -> RoadFeatureDetector:
-        K_flat = self.get_parameter('K').value
-        K = np.array(K_flat, dtype=np.float64).reshape(3, 3)
+        # Point cloud parameters
+        self.declare_parameter('max_points_per_cloud', 10000)
 
-        dist = np.array(self.get_parameter('dist_coeffs').value, dtype=np.float64)
+    def _load_parameters(self):
+        """Load all parameters from the parameter server"""
 
-        w = self.get_parameter('image_width').value
-        h = self.get_parameter('image_height').value
+        # Topic parameters
+        self.camera_topic       = self.get_parameter('camera_topic').value
+        self.camera_info_topic  = self.get_parameter('camera_info_topic').value
+        self.lane_mask_topic    = self.get_parameter('output_lane_mask_topic').value
+        self.bev_topic          = self.get_parameter('output_bev_topic').value
+        self.stats_topic        = self.get_parameter('output_stats_topic').value
 
-        detector = RoadFeatureDetector(
-            K=K,
-            camera_height=self.get_parameter('camera_height').value,
-            pitch_deg=self.get_parameter('pitch_deg').value,
-            yaw_deg=self.get_parameter('yaw_deg').value,
-            roll_deg=self.get_parameter('roll_deg').value,
-            image_size=(w, h),
-            dist_coeffs=dist,
-            min_radius=self.get_parameter('min_circle_radius').value,
-            max_radius=self.get_parameter('max_circle_radius').value,
+        # Camera parameters
+        self.camera_height = self.get_parameter('camera_height').value
+        self.pitch_deg     = self.get_parameter('pitch_deg').value
+        self.yaw_deg       = self.get_parameter('yaw_deg').value
+        self.roll_deg      = self.get_parameter('roll_deg').value
+
+        # Camera intrinsic matrix
+        fx = self.get_parameter('fx').value
+        fy = self.get_parameter('fy').value
+        cx = self.get_parameter('cx').value
+        cy = self.get_parameter('cy').value
+        self.dist_coeffs = self.get_parameter('dist_coeffs').value
+        self.K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+
+        # Detection parameters
+        self.min_radius = self.get_parameter('min_radius').value
+        self.max_radius = self.get_parameter('max_radius').value
+
+        # Lane geometry
+        self.lane_half_width = self.get_parameter('lane_half_width').value
+
+        # Debug parameters
+        self.publish_debug_images     = self.get_parameter('publish_debug_images').value
+        self.publish_performance_stats = self.get_parameter('publish_performance_stats').value
+
+        # Point cloud parameters
+        self.max_points_per_cloud = self.get_parameter('max_points_per_cloud').value
+
+        self.consecutive_error_counter = 0
+
+    def _validate_parameters(self):
+        """Validate critical parameters and log warnings/errors"""
+        valid = True
+
+        if self.camera_height <= 0:
+            self.get_logger().error(f"Camera height must be positive! Current: {self.camera_height}")
+            valid = False
+
+        if self.pitch_deg > 0:
+            self.get_logger().warn(f"Positive pitch ({self.pitch_deg}°) means camera is pointing up - road detection may fail")
+
+        if self.get_parameter('fx').value <= 0 or self.get_parameter('fy').value <= 0:
+            self.get_logger().error("Focal length (fx, fy) must be positive!")
+            valid = False
+
+        if self.min_radius >= self.max_radius:
+            self.get_logger().error(f"min_radius ({self.min_radius}) must be less than max_radius ({self.max_radius})")
+            valid = False
+
+        return valid
+
+    def setup_comms(self):
+        """Setup publishers, subscribers, and timers"""
+
+        image_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
         )
 
-        self._image_size = (w, h)
-        self.get_logger().info(f'Detector initialised — image size: {w}x{h}')
-        return detector
+        reliable_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10
+        )
 
-    # ----------------------------------------------------------------------
-    # Reinitialise detector if image dimensions differ from expected
-    # ----------------------------------------------------------------------
-    def _check_reinit(self, h: int, w: int):
-        if (w, h) != self._image_size:
-            self.get_logger().warn(
-                f'Image size changed to {w}x{h} — reinitialising detector.')
-            self.set_parameters([
-                rclpy.parameter.Parameter('image_width',  rclpy.Parameter.Type.INTEGER, w),
-                rclpy.parameter.Parameter('image_height', rclpy.Parameter.Type.INTEGER, h),
-            ])
-            self._detector = self._build_detector()
+        # Subscriber
+        self.sub = self.create_subscription(
+            Image,
+            self.camera_topic,
+            self.image_callback,
+            image_qos
+        )
 
-    # ----------------------------------------------------------------------
-    # Image callback
-    # ----------------------------------------------------------------------
-    def _image_callback(self, msg: Image):
-        try:
-            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().error(f'cv_bridge error: {e}')
+        # Lane / wall point cloud publishers
+        self.pc_pub      = self.create_publisher(PointCloud2, '/lane_points',         reliable_qos)
+        self.pub_left    = self.create_publisher(PointCloud2, '/virtual_walls/left',  reliable_qos)
+        self.pub_right   = self.create_publisher(PointCloud2, '/virtual_walls/right', reliable_qos)
+        self.pub_walls   = self.create_publisher(PointCloud2, '/virtual_walls',       reliable_qos)
+        self.pub_circles = self.create_publisher(PointCloud2, '/lane_circles',        reliable_qos)
+
+        # Optional debug image publishers
+        if self.publish_debug_images:
+            self.img_pub = self.create_publisher(Image, self.lane_mask_topic, reliable_qos)
+            self.bev_pub = self.create_publisher(Image, self.bev_topic,       reliable_qos)
+
+        # Optional stats publisher
+        if self.publish_performance_stats:
+            self.stats_pub = self.create_publisher(String, self.stats_topic, reliable_qos)
+
+    def initialize_pipeline(self, image_width, image_height):
+        """Initialize the pipeline with correct image dimensions"""
+        if self.pipeline is None:
+            # self.get_logger().info(f"Initializing pipeline with image size: {image_width}x{image_height}")
+
+            self.pipeline = RoadFeatureBEVPipeline(
+                K=self.K,
+                camera_height=self.camera_height,
+                pitch_deg=self.pitch_deg,
+                yaw_deg=self.yaw_deg,
+                roll_deg=self.roll_deg,
+                dist_coeffs=np.array(self.dist_coeffs).reshape(-1, 1),
+                image_size=(image_width, image_height),
+                min_radius=self.min_radius,
+                max_radius=self.max_radius
+            )
+
+            self.image_size = (image_width, image_height)
+            # self.get_logger().info("Pipeline initialization complete")
+
+    def image_callback(self, msg):
+        self._process_image(msg)
+
+    def process_latest_image(self):
+        """Process the latest image at controlled rate"""
+        if self.latest_image is None:
             return
+        msg = self.latest_image
+        self.latest_image = None
+        self._process_image(msg)
 
-        h, w = frame.shape[:2]
-        self._check_reinit(h, w)
+    def _process_image(self, msg):
+        """Process a single image frame"""
+        start_time = self.get_clock().now()
 
-        stamp      = msg.header.stamp
-        cam_frame  = self.get_parameter('camera_frame').value
-        lane_half  = self.get_parameter('lane_half_width').value
-
-        # ------------------------------------------------------------------
-        # Run detector
-        # ------------------------------------------------------------------
-        output, edges, lines, ground_circles, circle_clouds, _ = \
-            self._detector.process(frame, draw_bev=False)
-
-        bev_image = self._detector.bev.warp_to_bev(frame)
-
-        # ------------------------------------------------------------------
-        # Lane mask → ground points
-        # ------------------------------------------------------------------
-        lane_mask = self._lines_to_mask(lines, frame.shape)
-        pixels    = self._mask_to_pixels(lane_mask)
-
-        if len(pixels) > 0:
-            xy         = self._detector.bev.pixels_to_ground(pixels)
-            z          = np.zeros((len(xy), 1), dtype=np.float64)
-            lane_pts   = np.hstack([xy, z]).astype(np.float32)
-        else:
-            lane_pts = np.zeros((0, 3), dtype=np.float32)
-
-        # ------------------------------------------------------------------
-        # Split into left / right virtual walls
-        # ------------------------------------------------------------------
-        if len(lane_pts) > 0:
-            # X axis: negative = left of robot, positive = right
-            left_mask  = lane_pts[:, 0] < -lane_half
-            right_mask = lane_pts[:, 0] >  lane_half
-            left_pts   = lane_pts[left_mask]
-            right_pts  = lane_pts[right_mask]
-        else:
-            left_pts  = np.zeros((0, 3), dtype=np.float32)
-            right_pts = np.zeros((0, 3), dtype=np.float32)
-
-        # ------------------------------------------------------------------
-        # Circle clouds — concatenate all into one cloud
-        # ------------------------------------------------------------------
-        if circle_clouds:
-            circle_pts = np.vstack(circle_clouds).astype(np.float32)
-        else:
-            circle_pts = np.zeros((0, 3), dtype=np.float32)
-
-        # ------------------------------------------------------------------
-        # Publish point clouds
-        # ------------------------------------------------------------------
-        self._pub_lane.publish(   array_to_cloud(lane_pts,    cam_frame, stamp))
-        self._pub_left.publish(   array_to_cloud(left_pts,    cam_frame, stamp))
-        self._pub_right.publish(  array_to_cloud(right_pts,   cam_frame, stamp))
-        self._pub_circles.publish(array_to_cloud(circle_pts,  cam_frame, stamp))
-
-        # ------------------------------------------------------------------
-        # Publish debug images
-        # ------------------------------------------------------------------
         try:
-            self._pub_img.publish(self._bridge.cv2_to_imgmsg(output,    'bgr8'))
-            self._pub_bev.publish(self._bridge.cv2_to_imgmsg(bev_image, 'bgr8'))
+            try:
+                frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            except CvBridgeError as e:
+                self.get_logger().error(f"CV Bridge error: {e}")
+                return
+
+            if frame is None or frame.size == 0:
+                self.get_logger().warn("Empty frame received")
+                return
+
+            h, w = frame.shape[:2]
+
+            if self.pipeline is None:
+                self.initialize_pipeline(w, h)
+
+            try:
+                output, bev_image, lane_mask, lane_points, ground_circles, circle_clouds = \
+                    self.pipeline.process_frame(frame)
+            except Exception as e:
+                self.get_logger().error(f"Pipeline processing error: {e}")
+                self.consecutive_error_counter += 1
+                return
+
+            self.consecutive_error_counter = 0
+            frame_id = self.get_clock().now().to_msg()   # use node time for TF lookup
+
+            # ------------------------------------------------------------------
+            # Limit total lane points
+            # ------------------------------------------------------------------
+            if len(lane_points) > self.max_points_per_cloud:
+                lane_points = lane_points[:self.max_points_per_cloud]
+
+            # ------------------------------------------------------------------
+            # Split into left / right virtual walls
+            # ------------------------------------------------------------------
+            if len(lane_points) > 0:
+                left_pts  = lane_points[lane_points[:, 0] < -self.lane_half_width]
+                right_pts = lane_points[lane_points[:, 0] >  self.lane_half_width]
+                walls_pts = np.vstack([left_pts, right_pts]) \
+                            if (len(left_pts) + len(right_pts)) > 0 \
+                            else np.zeros((0, 3), dtype=np.float32)
+            else:
+                left_pts = right_pts = walls_pts = np.zeros((0, 3), dtype=np.float32)
+
+            cloud_frame = msg.header.frame_id
+
+            self.pc_pub.publish(   self.create_pointcloud2(lane_points, cloud_frame))
+            self.pub_left.publish( self.create_pointcloud2(left_pts,    cloud_frame))
+            self.pub_right.publish(self.create_pointcloud2(right_pts,   cloud_frame))
+            self.pub_walls.publish(self.create_pointcloud2(walls_pts,   cloud_frame))
+
+            # ------------------------------------------------------------------
+            # Circle clouds — merge all into one message
+            # ------------------------------------------------------------------
+            all_circle_pts = []
+            for cloud in circle_clouds:
+                if len(cloud) > 0:
+                    all_circle_pts.append(cloud[:self.max_points_per_cloud])
+            circle_pts = np.vstack(all_circle_pts) if all_circle_pts \
+                         else np.zeros((0, 3), dtype=np.float32)
+            self.pub_circles.publish(self.create_pointcloud2(circle_pts, cloud_frame))
+
+            self.get_logger().debug(
+                f'lane={len(lane_points)} left={len(left_pts)} '
+                f'right={len(right_pts)} circles={len(circle_pts)}')
+
+            # ------------------------------------------------------------------
+            # Debug images
+            # ------------------------------------------------------------------
+            if self.publish_debug_images:
+                if lane_mask is not None:
+                    try:
+                        out_msg = self.bridge.cv2_to_imgmsg(lane_mask, "passthrough")
+                        out_msg.header = msg.header
+                        self.img_pub.publish(out_msg)
+                    except CvBridgeError as e:
+                        self.get_logger().error(
+                            f"CV Bridge error for lane_mask "
+                            f"(shape={lane_mask.shape}, dtype={lane_mask.dtype}): {e}")
+                else:
+                    self.get_logger().warn("Lane mask is None, skipping debug image publish")
+
+                if bev_image is not None:
+                    try:
+                        bev_msg = self.bridge.cv2_to_imgmsg(bev_image, "passthrough")
+                        bev_msg.header = msg.header
+                        self.bev_pub.publish(bev_msg)
+                    except CvBridgeError as e:
+                        self.get_logger().error(
+                            f"CV Bridge error for bev_image "
+                            f"(shape={bev_image.shape}, dtype={bev_image.dtype}): {e}")
+                else:
+                    self.get_logger().warn("BEV image is None, skipping BEV debug image publish")
+
+            # ------------------------------------------------------------------
+            # Performance stats
+            # ------------------------------------------------------------------
+            if self.publish_performance_stats:
+                end_time = self.get_clock().now()
+                processing_ms = (end_time - start_time).nanoseconds / 1e6
+                self.update_performance_stats(processing_ms)
+
+            self.frame_count += 1
+            if self.frame_count % 100 == 0:
+                self.get_logger().info(f"Processed {self.frame_count} frames successfully")
+
         except Exception as e:
-            self.get_logger().error(f'Image publish error: {e}')
+            self.get_logger().error(
+                f"Unexpected error processing frame: {str(e)}",
+                throttle_duration_sec=5.0)
 
-        self.get_logger().debug(
-            f'lane={len(lane_pts)} left={len(left_pts)} '
-            f'right={len(right_pts)} circles={len(ground_circles)}')
+    def update_performance_stats(self, processing_ms):
+        """Update and publish performance statistics"""
+        self.processing_times.append(processing_ms)
 
-    # ----------------------------------------------------------------------
-    # Helpers
-    # ----------------------------------------------------------------------
-    @staticmethod
-    def _lines_to_mask(lines, shape):
-        mask = np.zeros(shape[:2], dtype=np.uint8)
-        if lines is None:
-            return mask
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(mask, (x1, y1), (x2, y2), 255, thickness=2)
-        return mask
+        if len(self.processing_times) > 30:
+            self.processing_times.pop(0)
 
-    @staticmethod
-    def _mask_to_pixels(mask):
-        ys, xs = np.where(mask > 0)
-        if len(xs) == 0:
-            return np.zeros((0, 2), dtype=np.float64)
-        return np.stack([xs, ys], axis=1).astype(np.float64)
+        avg_time = np.mean(self.processing_times)
+        std_time = np.std(self.processing_times)
+        fps = 1000.0 / avg_time if avg_time > 0 else 0
+
+        stats_msg = String()
+        stats_msg.data = (f"Frame: {self.frame_count}, "
+                          f"Processing: {processing_ms:.2f}ms, "
+                          f"Avg: {avg_time:.2f}ms ± {std_time:.2f}ms, "
+                          f"FPS: {fps:.1f}")
+
+        self.stats_pub.publish(stats_msg)
+
+        if self.frame_count % 100 == 0:
+            self.get_logger().info(stats_msg.data)
+
+    def create_pointcloud2(self, points, frame_id) -> PointCloud2:
+        """Convert numpy array of points to PointCloud2 message"""
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = frame_id
+
+        if len(points) == 0:
+            return point_cloud2.create_cloud_xyz32(header, np.zeros((0, 3)))
+
+        points_float32 = points.astype(np.float32)
+
+        mask = np.isfinite(points_float32).all(axis=1)
+        points_float32 = points_float32[mask]
+
+        if len(points_float32) == 0:
+            return point_cloud2.create_cloud_xyz32(header, np.zeros((0, 3)))
+
+        return point_cloud2.create_cloud_xyz32(header, points_float32)
+
+    def parameters_callback(self, params):
+        """Handle dynamic parameter updates"""
+        result = SetParametersResult(successful=True)
+
+        for param in params:
+            if param.name == 'publish_debug_images':
+                self.publish_debug_images = param.value
+                self.get_logger().info(f"Updated publish_debug_images to {self.publish_debug_images}")
+
+            elif param.name == 'publish_performance_stats':
+                self.publish_performance_stats = param.value
+                self.get_logger().info(f"Updated publish_performance_stats to {self.publish_performance_stats}")
+
+            elif param.name == 'max_points_per_cloud':
+                self.max_points_per_cloud = param.value
+                self.get_logger().info(f"Updated max_points_per_cloud to {self.max_points_per_cloud}")
+
+            elif param.name == 'lane_half_width':
+                self.lane_half_width = param.value
+                self.get_logger().info(f"Updated lane_half_width to {self.lane_half_width}")
+
+            elif param.name == 'camera_height' and self.pipeline is not None:
+                self.pipeline.set_camera_height(param.value)
+                self.get_logger().info(f"Updated camera_height to {param.value}")
+
+            elif param.name == 'pitch_deg' and self.pipeline is not None:
+                self.pipeline.set_pitch_deg(param.value)
+                self.get_logger().info(f"Updated pitch_deg to {param.value}")
+
+            elif param.name == 'yaw_deg' and self.pipeline is not None:
+                self.pipeline.set_yaw_deg(param.value)
+                self.get_logger().info(f"Updated yaw_deg to {param.value}")
+
+            elif param.name == 'roll_deg' and self.pipeline is not None:
+                self.pipeline.set_roll_deg(param.value)
+                self.get_logger().info(f"Updated roll_deg to {param.value}")
+
+            elif param.name == 'min_radius' and self.pipeline is not None:
+                self.pipeline.set_min_radius(param.value)
+                self.get_logger().info(f"Updated min_radius to {param.value}")
+
+            elif param.name == 'max_radius' and self.pipeline is not None:
+                self.pipeline.set_max_radius(param.value)
+                self.get_logger().info(f"Updated max_radius to {param.value}")
+
+            elif param.name == 'dist_coeffs' and self.pipeline is not None:
+                self.pipeline.set_dist_coeffs(param.value)
+                self.get_logger().info(f"Updated dist_coeffs to {param.value}")
+
+        return result
+
+    def get_statistics(self):
+        """Return current performance statistics"""
+        if not self.processing_times:
+            return None
+
+        return {
+            'frame_count':        self.frame_count,
+            'avg_processing_ms':  np.mean(self.processing_times),
+            'std_processing_ms':  np.std(self.processing_times),
+            'fps':                1000.0 / np.mean(self.processing_times)
+                                  if np.mean(self.processing_times) > 0 else 0,
+            'error_counter':      self.consecutive_error_counter
+        }
 
 
-# ---------------------------------------------------------------------------
 def main(args=None):
     rclpy.init(args=args)
-    node = LaneFilterNode()
+    node = RoadDetectorNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info("Shutdown requested by user")
+    except Exception as e:
+        node.get_logger().error(f"Unexpected error: {e}")
     finally:
+        stats = node.get_statistics()
+        if stats:
+            node.get_logger().info(f"Final statistics: {stats}")
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

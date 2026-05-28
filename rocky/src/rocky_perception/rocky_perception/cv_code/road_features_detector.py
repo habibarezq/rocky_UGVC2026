@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from cv2 import ximgproc
-from homography import HomographyBEV
+from .homography import HomographyBEV
 
 
 class RoadFeatureDetector:
@@ -208,62 +208,62 @@ class RoadFeatureDetector:
         return output, edges, lines, ground_circles, circle_clouds, bev_image
 
 
-# # ======================================================
-# # MAIN LOOP
-# # ======================================================
-# if __name__ == "__main__":
+# ======================================================
+# MAIN LOOP
+# ======================================================
+if __name__ == "__main__":
 
-#     K = np.array([
-#         [1000, 0, 960],
-#         [0, 1000, 540],
-#         [0, 0, 1]
-#     ], dtype=np.float64)
+    K = np.array([
+        [1000, 0, 960],
+        [0, 1000, 540],
+        [0, 0, 1]
+    ], dtype=np.float64)
 
-#     camera_height = 1.2
-#     pitch_deg = -30
+    camera_height = 1.2
+    pitch_deg = -30
 
-#     cap = cv2.VideoCapture("../data/raw/test_lane.mp4")
-#     if not cap.isOpened():
-#         print("Cannot open video file")
-#         exit()
+    cap = cv2.VideoCapture("../data/raw/test_lane.mp4")
+    # if not cap.isOpened():
+    #     print("Cannot open video file")
+    #     exit()
 
-#     ret, frame = cap.read()
-#     if not ret:
-#         print("Cannot read frame from camera")
-#         exit()
+    ret, frame = cap.read()
+    # if not ret:
+    #     print("Cannot read frame from camera")
+    #     exit()
 
-#     img_h, img_w = frame.shape[:2]
-#     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    img_h, img_w = frame.shape[:2]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-#     detector = RoadFeatureDetector(
-#         K=K,
-#         camera_height=camera_height,
-#         pitch_deg=pitch_deg,
-#         image_size=(img_w, img_h),
-#         yaw_deg=0,
-#         roll_deg=0
-#     )
+    detector = RoadFeatureDetector(
+        K=K,
+        camera_height=camera_height,
+        pitch_deg=pitch_deg,
+        image_size=(img_w, img_h),
+        yaw_deg=0,
+        roll_deg=0
+    )
 
-#     while True:
-#         ret, frame = cap.read()
-#         if not ret:
-#             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-#             continue
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
 
-#         output, edges, lines, ground_circles, circle_clouds, bev = \
-#             detector.process(frame, draw_bev=True)
+        output, edges, lines, ground_circles, circle_clouds, bev = \
+            detector.process(frame, draw_bev=True)
 
-#         print("Ground circles:", ground_circles)
-#         for i, cloud in enumerate(circle_clouds):
-#             print(f"  circle {i+1} cloud points: {len(cloud)}")
+        print("Ground circles:", ground_circles)
+        for i, cloud in enumerate(circle_clouds):
+            print(f"  circle {i+1} cloud points: {len(cloud)}")
 
-#         cv2.imshow("Road Features", output)
-#         cv2.imshow("Edges", edges)
-#         if bev is not None:
-#             cv2.imshow("BEV", bev)
+        cv2.imshow("Road Features", output)
+        cv2.imshow("Edges", edges)
+        if bev is not None:
+            cv2.imshow("BEV", bev)
 
-#         if cv2.waitKey(1) == 27:
-#             break
+        if cv2.waitKey(1) == 27:
+            break
 
-#     cap.release()
-#     cv2.destroyAllWindows()
+    cap.release()
+    cv2.destroyAllWindows()

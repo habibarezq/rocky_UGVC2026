@@ -1,0 +1,48 @@
+road_detector_node:
+  ros__parameters:
+    use_sim_time: True
+    show_debug:       True
+    # ---------- Topics ----------
+    image_topic:   /camera/image_raw
+    camera_frame:  camera_link_optical
+
+    # ---------- Camera intrinsics ----------
+    # Row-major 3x3 matrix → 9 values
+    K:
+      - 793.79768697
+      - 0.0
+      - 290.78702859
+      - 0.0
+      - 813.96117996
+      - 241.57106901
+      - 0.0
+      - 0.0
+      - 1.0
+
+    # Distortion coefficients [k1, k2, p1, p2, k3]
+    dist_coeffs:
+      - -4.97661814e-01
+      -  8.05356640e+00
+      -  9.44660547e-03
+      - -2.64434172e-02
+      - -4.33974203e+01
+
+    # ---------- Camera extrinsics ----------
+    camera_height:  1.33      # metres above ground
+    pitch_deg:     -45.0      # negative = looking down
+    yaw_deg:        -2.0
+    roll_deg:       -7.0
+
+    # ---------- Image size (pixels) ----------
+    image_width:   640
+    image_height:  480
+
+    # ---------- Lane geometry ----------
+    lane_half_width: 0.375    # half the lane width in metres
+
+    # ---------- Circle detector limits ----------
+    min_circle_radius: 10     # pixels
+    max_circle_radius: 200    # pixels
+
+    output_frame: "odom"  # frame for published point clouds (virtual walls)
+

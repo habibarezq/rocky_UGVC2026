@@ -10,6 +10,13 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+            ('share/'+package_name+'/config', [
+                'config/road_detector_params.yaml',
+                'config/lane_follower_params.yaml',
+            ]),
+            ('share/'+package_name+'/launch', [
+                'launch/road_detector.launch.py',
+            ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +33,7 @@ setup(
         'console_scripts': [
             "lane_filter_node = rocky_perception.lane_filter_node:main",
             "lane_follower_node = rocky_perception.lane_follower_node:main",
+            "road_detector_node = rocky_perception.road_detector_node:main",
         ],
     },
 )

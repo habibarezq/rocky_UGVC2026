@@ -1,145 +1,4 @@
 
-
-# ---------------------------------------------------------------------------
-#  Virtual Wall Node
-# ---------------------------------------------------------------------------
-lane_filter_node:
-  ros__parameters:
-    # show_debug:       True
-    # ---------- Topics ----------
-    image_topic:   /camera/image_raw
-    camera_frame:  camera_link_optical
-
-    # ---------- Camera intrinsics ----------
-    # Row-major 3x3 matrix → 9 values
-    K:
-      - 793.79768697
-      - 0.0
-      - 290.78702859
-      - 0.0
-      - 813.96117996
-      - 241.57106901
-      - 0.0
-      - 0.0
-      - 1.0
-
-    # Distortion coefficients [k1, k2, p1, p2, k3]
-    dist_coeffs:
-      - -4.97661814e-01
-      -  8.05356640e+00
-      -  9.44660547e-03
-      - -2.64434172e-02
-      - -4.33974203e+01
-
-    # ---------- Camera extrinsics ----------
-    camera_height:  1.33      # metres above ground
-    pitch_deg:     -45.0      # negative = looking down
-    yaw_deg:        -2.0
-    roll_deg:       -7.0
-
-    # ---------- Image size (pixels) ----------
-    image_width:   640
-    image_height:  480
-
-    # ---------- Lane geometry ----------
-    lane_half_width: 0.375    # half the lane width in metres
-
-    # ---------- Circle detector limits ----------
-    min_circle_radius: 10     # pixels
-    max_circle_radius: 200    # pixels
-
-
-lane_follower_node:
-  ros__parameters:
-
-    # ---------- Input cloud topics (must match lane_filter_node output) ----------
-    left_cloud_topic:  /virtual_walls/left
-    right_cloud_topic: /virtual_walls/right
-
-    # ---------- Lookahead / slice geometry ----------
-    lookahead_distance:  1.5    # metres — furthest depth slice checked
-    lookahead_step:      0.5    # metres — spacing between depth slices
-    slice_tolerance:     0.25   # metres — ±Z band for each depth slice
-
-    # ---------- Navigation ----------
-    min_remaining_dist: 0.7     # metres — re-send goal when this close to current
-    startup_delay_sec:  0.0     # seconds — wait before first goal
-    nav_goal_timeout:  30.0     # seconds — cancel goal if stalled this long
-    abort_cooldown_sec: 2.0     # seconds — pause after genuine Nav2 failure
-
-    # ---------- Lane / curve geometry ----------
-    lane_width:          0.75   # metres
-    curve_detect_thresh: 0.08   # lateral offset (m) that triggers curve mode
-    curve_lookahead:     0.4    # metres — shortened lookahead on curves
-
-    # ---------- Goal deduplication ----------
-    goal_update_dist:    0.30   # metres — only update goal if it shifted this much
-# lane_filter_node:
-#   ros__parameters:
-#     use_sim_time:     True
-#     camera_frame:     camera_link_optical   # [FIX-6] was camera_link — matches Gazebo TF frame, avoids TF lookup failure
-#     output_frame:     odom      # [FIX-6] publish in odom — eliminates costmap TF lookup failure
-#     fx:               614.65
-#     fy:               614.65
-#     cx:               320.0
-#     cy:               240.0
-
-#     # [FIX-5]
-#     depth_min:        0.5      # was 3.0 — near walls were invisible
-#     depth_max:        1.5      # was 6.0 — far curve markings flooded costmap
-
-#     ground_y_min:     0.05 # was 0.01
-#     ground_y_max:     0.25
-#     lateral_x_max:    0.6 # clips lateral outliers on curves
-#     pixel_stride:     8        # [FIX-7] was 2 (~3300 pts/frame) → 8 (~200 pts) stops blob clusters
-
-#     # HSV — white lane
-#     white_h_min:      0
-#     white_h_max:      180
-#     white_s_min:      0
-#     white_s_max:      55
-#     white_v_min:      190 # was 195
-#     white_v_max:      255
-
-#     # # HSV — yellow lane
-#     # yellow_h_min:     18
-#     # yellow_h_max:     35
-#     # yellow_s_min:     80
-#     # yellow_s_max:     255
-#     # yellow_v_min:     70 # was 100
-#     # yellow_v_max:     255
-
-#       # HSV — yellow lane
-#     yellow_h_min:     0
-#     yellow_h_max:     0
-#     yellow_s_min:     0
-#     yellow_s_max:    0
-#     yellow_v_min:     255 # was 100
-#     yellow_v_max:     255
-
-#     publish_split_walls: True
-#     show_debug:       True
-#     sync_queue_size:  5
-#     sync_slop:        0.5
-
-# # ---------------------------------------------------------------------------
-# #  Lane Follower Node
-# # ---------------------------------------------------------------------------
-# lane_follower_node:
-#   ros__parameters:
-#     use_sim_time:          True
-#     lookahead_distance:    0.8 #was 1.5
-#     lookahead_step:        0.5
-#     slice_tolerance:       0.25 # was 0.25 — tighter goal acceptance on curves reduces oscillation and jitter
-#     min_remaining_dist:    0.7 # was 0.4
-#     startup_delay_sec:     0.0
-#     nav_goal_timeout:      30.0
-#     abort_cooldown_sec:    2.0
-#     lane_width:            0.65 # was 0.75
-#     curve_detect_thresh:   0.12
-#     curve_lookahead:       0.5 #was 0.8
-#     goal_update_dist:      0.30   # only replace goal if it shifts > 0.30 m
-
 # =============================================================================
 #  LOCAL COSTMAP
 local_costmap:
@@ -185,7 +44,7 @@ local_costmap:
         enabled: True
         observation_sources: virtual_walls
         virtual_walls:
-          topic: /virtual_walls
+          topic: /road_detector/pointcloud
           data_type: "PointCloud2"
           min_obstacle_height: -5.0
           max_obstacle_height:  5.0
@@ -263,7 +122,7 @@ global_costmap:
         enabled: True
         observation_sources: virtual_walls
         virtual_walls:
-          topic: /virtual_walls
+          topic: /road_detector/pointcloud
           data_type: "PointCloud2"
           min_obstacle_height: -5.0
           max_obstacle_height:  5.0

@@ -1,0 +1,25 @@
+lane_follower_node:
+  ros__parameters:
+
+    # ---------- Input cloud topics (must match lane_filter_node output) ----------
+    cloud_topic: "/road_detector/pointcloud"
+    use_sim_time: True
+
+    # ---------- Lookahead / slice geometry ----------
+    lookahead_distance:  1.5    # metres — furthest depth slice checked
+    lookahead_step:      0.5    # metres — spacing between depth slices
+    slice_tolerance:     0.25   # metres — ±Z band for each depth slice
+
+    # ---------- Navigation ----------
+    min_remaining_dist: 0.7     # metres — re-send goal when this close to current
+    startup_delay_sec:  0.0     # seconds — wait before first goal
+    nav_goal_timeout:  30.0     # seconds — cancel goal if stalled this long
+    abort_cooldown_sec: 2.0     # seconds — pause after genuine Nav2 failure
+
+    # ---------- Lane / curve geometry ----------
+    lane_width:          0.75   # metres
+    curve_detect_thresh: 0.08   # lateral offset (m) that triggers curve mode
+    curve_lookahead:     0.4    # metres — shortened lookahead on curves
+
+    # ---------- Goal deduplication ----------
+    goal_update_dist:    0.30   # metres — only update goal if it shifted this much

@@ -21,7 +21,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
 
     rocky_nav_dir = get_package_share_directory('rocky_navigation')
-    
+    rocky_precp_dir = get_package_share_directory('rocky_perception')
     # ------------------------------------------------------------------ #
     #  BT XML paths                                                        #
     # ------------------------------------------------------------------ #
@@ -40,6 +40,8 @@ def generate_launch_description():
     #  Patch nav2_params.yaml — inject BT XML paths                       #
     # ------------------------------------------------------------------ #
     src_params = os.path.join(rocky_nav_dir, 'config', 'nav2_params.yaml')
+    road_detector_params = os.path.join(rocky_precp_dir, 'config', 'road_detector_params.yaml')
+    lane_follower_params = os.path.join(rocky_precp_dir, 'config', 'lane_follower_params.yaml')
     with open(src_params, 'r') as fh:
         params = yaml.safe_load(fh)
 
@@ -133,10 +135,10 @@ def generate_launch_description():
         actions=[
             Node(
                 package='rocky_perception',
-                executable='lane_filter_node',
-                name='lane_filter_node',
+                executable='road_detector_node',
+                name='road_detector_node',
                 output='screen',
-                parameters=[src_params],
+                parameters=[road_detector_params, {'use_sim_time': use_sim_time}],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=[
                     ('/camera/image_raw',       '/camera/image_raw'),
@@ -158,9 +160,8 @@ def generate_launch_description():
                 executable='lane_follower_node',
                 name='lane_follower_node',
                 output='screen',
-                parameters=[{
+                parameters=[lane_follower_params, {
                     'use_sim_time':       use_sim_time,
-                    'lookahead_distance': LaunchConfiguration('lookahead_distance'),
                     'min_remaining_dist': 0.8,
                     'startup_delay_sec':  0.0,
                     'nav_goal_timeout':   25.0,
