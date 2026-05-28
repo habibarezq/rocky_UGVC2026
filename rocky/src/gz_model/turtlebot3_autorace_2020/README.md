@@ -1,0 +1,1 @@
+export GZ_SIM_RESOURCE_PATH=$GZ_SIM_RESOURCE_PATH:$HOME/aur-26/rocky_UGVC2026/rocky/src/gz_model
