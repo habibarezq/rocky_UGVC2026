@@ -1,295 +1,289 @@
 #!/usr/bin/env python3
 """
-Virtual Wall Node  (lane_filter_node)
-======================================
-Converts camera lane detection (white + yellow markings) into Nav2
-PointCloud2 virtual walls so the costmap keeps the robot inside its lane.
+Lane Filter Node
+================
+Subscribes to a raw camera image, runs the RoadFeatureDetector pipeline,
+and publishes:
+  - /lane_points          (sensor_msgs/PointCloud2)  — ground-plane lane pixels
+  - /virtual_walls/left   (sensor_msgs/PointCloud2)  — left lane wall
+  - /virtual_walls/right  (sensor_msgs/PointCloud2)  — right lane wall
+  - /lane_circles         (sensor_msgs/PointCloud2)  — circle contour clouds
+  - /lane_image           (sensor_msgs/Image)        — annotated debug image
+  - /bev_image            (sensor_msgs/Image)        — bird's-eye-view image
 
-Architecture
-------------
-  Camera RGB + Depth  →  HSV colour mask  →  back-project to 3-D  →
-  ground-plane filter  →  /virtual_walls (PointCloud2, camera frame)
+Camera intrinsics and extrinsics are loaded from ROS parameters so they can
+be overridden at launch without recompiling.
 
-  Nav2 costmap lane_layer subscribes to /virtual_walls and, via the
-  TF tree, stamps those points as lethal obstacles in odom/map frames.
-
-Changes in this version
------------------------
-  * depth_min restored to 0.5 m (3.0 was only detecting markings 3 m+ away)
-  * Lateral X clamp prevents far curve markings flooding the wrong lane side
-  * Z-distance bucketing: points are grouped by depth slice so the costmap
-    gets a structured wall shape instead of a blob
-  * Curve-aware ground_y tolerance: widens slightly for far points
-  * show_debug now overlays per-colour mask + 3-D point count per channel
+Left / right wall splitting:
+  Lane points with X < -lane_half_width are published on /virtual_walls/left,
+  points with X >  lane_half_width on /virtual_walls/right, where X is the
+  lateral ground coordinate (positive = right of camera optical axis).
 """
 
+import numpy as np
+import cv2
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image, PointCloud2
-from sensor_msgs_py import point_cloud2
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_msgs.msg import Header
-from cv_bridge import CvBridge, CvBridgeError
-import message_filters
-import cv2
-import numpy as np
+import sensor_msgs_py.point_cloud2 as pc2
+from cv_bridge import CvBridge
+from road_features_detector import RoadFeatureDetector
 
 
 # ---------------------------------------------------------------------------
-# QoS
+# Helper: numpy (N,3) → PointCloud2
 # ---------------------------------------------------------------------------
-SENSOR_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.VOLATILE,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=5,
-)
+def array_to_cloud(points: np.ndarray, frame_id: str, stamp) -> PointCloud2:
+    """Convert an (N, 3) float32/float64 array to a PointCloud2 message."""
+    header = Header()
+    header.frame_id = frame_id
+    header.stamp    = stamp
 
-DEFAULT_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.VOLATILE,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=10,
-)
+    fields = [
+        PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+    ]
+
+    pts = points.astype(np.float32)
+    cloud = pc2.create_cloud(header, fields, pts)
+    return cloud
 
 
-class VirtualWallNode(Node):
-    """Converts camera lane markings into Nav2 PointCloud2 virtual walls."""
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
+class LaneFilterNode(Node):
 
     def __init__(self):
-        super().__init__('virtual_wall_node')
+        super().__init__('lane_filter_node')
 
         # ------------------------------------------------------------------
-        # Parameters
+        # Declare parameters (can be set in launch file or YAML config)
         # ------------------------------------------------------------------
-        self.declare_parameter('camera_frame',       'camera_link_optical')
-        self.declare_parameter('fx',                 205.5) #using the /camera/info topic to verify was 205.5
-        self.declare_parameter('fy',                 205.5)
-        self.declare_parameter('cx',                 320.0)
-        self.declare_parameter('cy',                 240.0)
-
-        # Depth range — 0.5 m min avoids noise right under the robot
-        self.declare_parameter('depth_min',          0.5)
-        self.declare_parameter('depth_max',          4.0)
-
-        # Ground-plane Y filter (optical frame, Y = down)
-        # Camera ~0.08 m above floor → markings sit 0.02–0.25 m below centre
-        self.declare_parameter('ground_y_min',       0.01)
-        self.declare_parameter('ground_y_max',       0.25)
-
-        # Lateral clamp — ignore detections clearly outside 1 lane width
-        self.declare_parameter('lateral_x_max',      1.2)
-
-        # Subsample stride (CPU vs accuracy)
-        self.declare_parameter('pixel_stride',       2)
-
-        # HSV — white lane
-        self.declare_parameter('white_h_min',        0)
-        self.declare_parameter('white_h_max',        180)
-        self.declare_parameter('white_s_min',        0)
-        self.declare_parameter('white_s_max',        55)
-        self.declare_parameter('white_v_min',        190) # was 195
-        self.declare_parameter('white_v_max',        255)
-
-        # HSV — yellow lane
-        self.declare_parameter('yellow_h_min',       18)
-        self.declare_parameter('yellow_h_max',       35)
-        self.declare_parameter('yellow_s_min',       80)
-        self.declare_parameter('yellow_s_max',       255)
-        self.declare_parameter('yellow_v_min',       85) # was 100
-        self.declare_parameter('yellow_v_max',       255)
-
-        # Diagnostics
-        self.declare_parameter('publish_split_walls', True)
-        self.declare_parameter('show_debug',          False)
-
-        # Synchroniser
-        self.declare_parameter('sync_queue_size',     5)
-        self.declare_parameter('sync_slop',           0.5)
-
-        self._read_params()
+        self._declare_params()
 
         # ------------------------------------------------------------------
-        self.bridge = CvBridge()
+        # Build detector from parameters
+        # ------------------------------------------------------------------
+        self._detector = self._build_detector()
 
-        color_sub = message_filters.Subscriber(
-            self, Image, '/camera/image_raw',        qos_profile=SENSOR_QOS)
-        depth_sub = message_filters.Subscriber(
-            self, Image, '/camera/depth/image_raw',  qos_profile=SENSOR_QOS)
+        # ------------------------------------------------------------------
+        # CV Bridge
+        # ------------------------------------------------------------------
+        self._bridge = CvBridge()
 
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [color_sub, depth_sub],
-            queue_size=self.sync_queue_size,
-            slop=self.sync_slop,
-        )
-        self.sync.registerCallback(self._synced_callback)
+        # ------------------------------------------------------------------
+        # Publishers
+        # ------------------------------------------------------------------
+        self._pub_lane      = self.create_publisher(PointCloud2, '/lane_points',         5)
+        self._pub_left      = self.create_publisher(PointCloud2, '/virtual_walls/left',  5)
+        self._pub_right     = self.create_publisher(PointCloud2, '/virtual_walls/right', 5)
+        self._pub_circles   = self.create_publisher(PointCloud2, '/lane_circles',        5)
+        self._pub_img       = self.create_publisher(Image,       '/lane_image',          5)
+        self._pub_bev       = self.create_publisher(Image,       '/bev_image',           5)
 
-        self.wall_pub = self.create_publisher(PointCloud2, '/virtual_walls', DEFAULT_QOS)
-
-        if self.publish_split_walls:
-            self.left_pub  = self.create_publisher(PointCloud2, '/virtual_walls/left',  DEFAULT_QOS)
-            self.right_pub = self.create_publisher(PointCloud2, '/virtual_walls/right', DEFAULT_QOS)
+        # ------------------------------------------------------------------
+        # Subscriber
+        # ------------------------------------------------------------------
+        image_topic = self.get_parameter('image_topic').value
+        self._sub = self.create_subscription(
+            Image, image_topic, self._image_callback, 5)
 
         self.get_logger().info(
-            f'VirtualWallNode ready | frame={self.camera_frame} '
-            f'depth=[{self.depth_min:.2f}, {self.depth_max:.2f}] m | '
-            f'ground_y=[{self.ground_y_min:.3f}, {self.ground_y_max:.3f}] m | '
-            f'lateral_x_max={self.lateral_x_max:.2f} m | '
-            f'stride={self.pixel_stride} | debug={self.show_debug}'
+            f'LaneFilterNode ready — subscribing to [{image_topic}]')
+
+    # ----------------------------------------------------------------------
+    # Parameter declarations
+    # ----------------------------------------------------------------------
+    def _declare_params(self):
+        def dp(name, value, description=''):
+            descriptor = ParameterDescriptor(description=description)
+            self.declare_parameter(name, value, descriptor)
+
+        # Topics
+        dp('image_topic', '/camera/image_raw', 'Input image topic')
+        dp('camera_frame', 'camera_link_optical', 'Camera optical frame id')
+
+        # Intrinsics — flat list [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+        dp('K', [793.79768697, 0.0, 290.78702859,
+                 0.0, 813.96117996, 241.57106901,
+                 0.0, 0.0, 1.0],
+           'Camera intrinsic matrix (row-major, 9 values)')
+
+        # Distortion — [k1, k2, p1, p2, k3]
+        dp('dist_coeffs',
+           [-4.97661814e-01, 8.05356640e+00, 9.44660547e-03,
+            -2.64434172e-02, -4.33974203e+01],
+           'Distortion coefficients [k1,k2,p1,p2,k3]')
+
+        # Extrinsics
+        dp('camera_height', 1.33,   'Camera height above ground (m)')
+        dp('pitch_deg',    -45.0,   'Camera pitch angle (degrees, negative = down)')
+        dp('yaw_deg',       -2.0,   'Camera yaw angle (degrees)')
+        dp('roll_deg',      -7.0,   'Camera roll angle (degrees)')
+
+        # Image size — used to initialize homography; will be overridden
+        # on first frame if it does not match the incoming stream.
+        dp('image_width',   640, 'Expected image width  (pixels)')
+        dp('image_height',  480, 'Expected image height (pixels)')
+
+        # Lane geometry
+        dp('lane_half_width', 0.375,
+           'Half-width of lane (m). Points |X| > this split L/R wall.')
+
+        # Detection limits
+        dp('min_circle_radius', 10,  'Min circle radius in pixels')
+        dp('max_circle_radius', 200, 'Max circle radius in pixels')
+
+    # ----------------------------------------------------------------------
+    # Build detector
+    # ----------------------------------------------------------------------
+    def _build_detector(self) -> RoadFeatureDetector:
+        K_flat = self.get_parameter('K').value
+        K = np.array(K_flat, dtype=np.float64).reshape(3, 3)
+
+        dist = np.array(self.get_parameter('dist_coeffs').value, dtype=np.float64)
+
+        w = self.get_parameter('image_width').value
+        h = self.get_parameter('image_height').value
+
+        detector = RoadFeatureDetector(
+            K=K,
+            camera_height=self.get_parameter('camera_height').value,
+            pitch_deg=self.get_parameter('pitch_deg').value,
+            yaw_deg=self.get_parameter('yaw_deg').value,
+            roll_deg=self.get_parameter('roll_deg').value,
+            image_size=(w, h),
+            dist_coeffs=dist,
+            min_radius=self.get_parameter('min_circle_radius').value,
+            max_radius=self.get_parameter('max_circle_radius').value,
         )
 
-    # ------------------------------------------------------------------
-    def _read_params(self):
-        gp = lambda n: self.get_parameter(n).value
-        self.camera_frame        = gp('camera_frame')
-        self.fx                  = gp('fx')
-        self.fy                  = gp('fy')
-        self.cx                  = gp('cx')
-        self.cy                  = gp('cy')
-        self.depth_min           = gp('depth_min')
-        self.depth_max           = gp('depth_max')
-        self.ground_y_min        = gp('ground_y_min')
-        self.ground_y_max        = gp('ground_y_max')
-        self.lateral_x_max       = gp('lateral_x_max')
-        self.pixel_stride        = gp('pixel_stride')
-        self.publish_split_walls = gp('publish_split_walls')
-        self.show_debug          = gp('show_debug')
-        self.sync_queue_size     = gp('sync_queue_size')
-        self.sync_slop           = gp('sync_slop')
+        self._image_size = (w, h)
+        self.get_logger().info(f'Detector initialised — image size: {w}x{h}')
+        return detector
 
-        self.lower_white  = np.array([gp('white_h_min'),  gp('white_s_min'),  gp('white_v_min')],  dtype=np.uint8)
-        self.upper_white  = np.array([gp('white_h_max'),  gp('white_s_max'),  gp('white_v_max')],  dtype=np.uint8)
-        self.lower_yellow = np.array([gp('yellow_h_min'), gp('yellow_s_min'), gp('yellow_v_min')], dtype=np.uint8)
-        self.upper_yellow = np.array([gp('yellow_h_max'), gp('yellow_s_max'), gp('yellow_v_max')], dtype=np.uint8)
+    # ----------------------------------------------------------------------
+    # Reinitialise detector if image dimensions differ from expected
+    # ----------------------------------------------------------------------
+    def _check_reinit(self, h: int, w: int):
+        if (w, h) != self._image_size:
+            self.get_logger().warn(
+                f'Image size changed to {w}x{h} — reinitialising detector.')
+            self.set_parameters([
+                rclpy.parameter.Parameter('image_width',  rclpy.Parameter.Type.INTEGER, w),
+                rclpy.parameter.Parameter('image_height', rclpy.Parameter.Type.INTEGER, h),
+            ])
+            self._detector = self._build_detector()
 
-    # ------------------------------------------------------------------
-    def _synced_callback(self, color_msg: Image, depth_msg: Image):
-        stamp = color_msg.header.stamp
-
+    # ----------------------------------------------------------------------
+    # Image callback
+    # ----------------------------------------------------------------------
+    def _image_callback(self, msg: Image):
         try:
-            cv_bgr   = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
-            cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
-        except CvBridgeError as exc:
-            self.get_logger().warn(f'CvBridge error: {exc}', throttle_duration_sec=2.0)
-            self._publish_empty(stamp)
+            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'cv_bridge error: {e}')
             return
 
-        # Colour segmentation
-        hsv          = cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2HSV)
-        mask_white   = cv2.inRange(hsv, self.lower_white,  self.upper_white)
-        mask_yellow  = cv2.inRange(hsv, self.lower_yellow, self.upper_yellow)
-        mask_all     = cv2.bitwise_or(mask_white, mask_yellow)
+        h, w = frame.shape[:2]
+        self._check_reinit(h, w)
 
-        # Morphological clean-up
-        kernel      = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_white  = cv2.morphologyEx(mask_white,  cv2.MORPH_OPEN,  kernel)
-        mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN,  kernel)
-        mask_all    = cv2.morphologyEx(mask_all,    cv2.MORPH_CLOSE, kernel)
+        stamp      = msg.header.stamp
+        cam_frame  = self.get_parameter('camera_frame').value
+        lane_half  = self.get_parameter('lane_half_width').value
 
-        # Sanitise depth
-        cv_depth = np.nan_to_num(cv_depth, nan=0.0, posinf=0.0, neginf=0.0)
+        # ------------------------------------------------------------------
+        # Run detector
+        # ------------------------------------------------------------------
+        output, edges, lines, ground_circles, circle_clouds, _ = \
+            self._detector.process(frame, draw_bev=False)
 
-        # Back-project + filter
-        all_pts = self._project_and_filter(mask_all, cv_depth)
+        bev_image = self._detector.bev.warp_to_bev(frame)
 
-        header = Header(frame_id=self.camera_frame, stamp=stamp)
+        # ------------------------------------------------------------------
+        # Lane mask → ground points
+        # ------------------------------------------------------------------
+        lane_mask = self._lines_to_mask(lines, frame.shape)
+        pixels    = self._mask_to_pixels(lane_mask)
 
-        if all_pts is not None and all_pts[0].size > 0:
-            x, y, z = all_pts
-            pts   = np.column_stack([x, y, z]).astype(np.float32)
-            cloud = point_cloud2.create_cloud_xyz32(header, pts.tolist())
+        if len(pixels) > 0:
+            xy         = self._detector.bev.pixels_to_ground(pixels)
+            z          = np.zeros((len(xy), 1), dtype=np.float64)
+            lane_pts   = np.hstack([xy, z]).astype(np.float32)
         else:
-            cloud = point_cloud2.create_cloud_xyz32(header, [])
+            lane_pts = np.zeros((0, 3), dtype=np.float32)
 
-        self.wall_pub.publish(cloud)
+        # ------------------------------------------------------------------
+        # Split into left / right virtual walls
+        # ------------------------------------------------------------------
+        if len(lane_pts) > 0:
+            # X axis: negative = left of robot, positive = right
+            left_mask  = lane_pts[:, 0] < -lane_half
+            right_mask = lane_pts[:, 0] >  lane_half
+            left_pts   = lane_pts[left_mask]
+            right_pts  = lane_pts[right_mask]
+        else:
+            left_pts  = np.zeros((0, 3), dtype=np.float32)
+            right_pts = np.zeros((0, 3), dtype=np.float32)
 
-        if self.publish_split_walls:
-            self._publish_split(mask_white, mask_yellow, cv_depth, stamp)
+        # ------------------------------------------------------------------
+        # Circle clouds — concatenate all into one cloud
+        # ------------------------------------------------------------------
+        if circle_clouds:
+            circle_pts = np.vstack(circle_clouds).astype(np.float32)
+        else:
+            circle_pts = np.zeros((0, 3), dtype=np.float32)
 
-        if self.show_debug:
-            n = all_pts[0].size if all_pts is not None else 0
-            self._show_debug(cv_bgr, mask_white, mask_yellow, mask_all, n)
+        # ------------------------------------------------------------------
+        # Publish point clouds
+        # ------------------------------------------------------------------
+        self._pub_lane.publish(   array_to_cloud(lane_pts,    cam_frame, stamp))
+        self._pub_left.publish(   array_to_cloud(left_pts,    cam_frame, stamp))
+        self._pub_right.publish(  array_to_cloud(right_pts,   cam_frame, stamp))
+        self._pub_circles.publish(array_to_cloud(circle_pts,  cam_frame, stamp))
 
-    # ------------------------------------------------------------------
-    def _project_and_filter(self, mask: np.ndarray, depth: np.ndarray):
-        """
-        Back-project lane pixels to 3-D optical frame, apply ground-plane
-        and lateral filters.
+        # ------------------------------------------------------------------
+        # Publish debug images
+        # ------------------------------------------------------------------
+        try:
+            self._pub_img.publish(self._bridge.cv2_to_imgmsg(output,    'bgr8'))
+            self._pub_bev.publish(self._bridge.cv2_to_imgmsg(bev_image, 'bgr8'))
+        except Exception as e:
+            self.get_logger().error(f'Image publish error: {e}')
 
-        Curve-aware ground_y tolerance: for far points (z > 2 m) the
-        ground_y_max is relaxed by 20 % to catch markings that project
-        slightly higher due to perspective on curves.
-        """
-        v_idx, u_idx = np.where(mask == 255)
-        if v_idx.size == 0:
-            return None
+        self.get_logger().debug(
+            f'lane={len(lane_pts)} left={len(left_pts)} '
+            f'right={len(right_pts)} circles={len(ground_circles)}')
 
-        v_idx = v_idx[::self.pixel_stride]
-        u_idx = u_idx[::self.pixel_stride]
+    # ----------------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _lines_to_mask(lines, shape):
+        mask = np.zeros(shape[:2], dtype=np.uint8)
+        if lines is None:
+            return mask
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(mask, (x1, y1), (x2, y2), 255, thickness=2)
+        return mask
 
-        z = depth[v_idx, u_idx]
-
-        # Depth range filter
-        valid = (z >= self.depth_min) & (z <= self.depth_max)
-        v_idx, u_idx, z = v_idx[valid], u_idx[valid], z[valid]
-        if v_idx.size == 0:
-            return None
-
-        # Pin-hole back-projection
-        x = (u_idx - self.cx) * z / self.fx
-        y = (v_idx - self.cy) * z / self.fy
-
-        # Curve-aware ground_y_max: relax 20% for far points
-        y_max_adaptive = np.where(z > 2.0,
-                                  self.ground_y_max * 1.2,
-                                  self.ground_y_max)
-
-        keep = (
-            (y >= self.ground_y_min) &
-            (y <= y_max_adaptive) &
-            (np.abs(x) <= self.lateral_x_max)
-        )
-        return x[keep], y[keep], z[keep]
-
-    # ------------------------------------------------------------------
-    def _publish_split(self, mask_white, mask_yellow, cv_depth, stamp):
-        header = Header(frame_id=self.camera_frame, stamp=stamp)
-        for mask, pub in [(mask_yellow, self.left_pub), (mask_white, self.right_pub)]:
-            result = self._project_and_filter(mask, cv_depth)
-            if result is not None and result[0].size > 0:
-                x, y, z = result
-                arr = np.column_stack([x, y, z]).astype(np.float32)
-                pub.publish(point_cloud2.create_cloud_xyz32(header, arr.tolist()))
-            else:
-                pub.publish(point_cloud2.create_cloud_xyz32(header, []))
-
-    # ------------------------------------------------------------------
-    def _publish_empty(self, stamp):
-        header = Header(frame_id=self.camera_frame, stamp=stamp)
-        empty  = point_cloud2.create_cloud_xyz32(header, [])
-        self.wall_pub.publish(empty)
-        if self.publish_split_walls:
-            self.left_pub.publish(empty)
-            self.right_pub.publish(empty)
-
-    # ------------------------------------------------------------------
-    def _show_debug(self, bgr, mask_white, mask_yellow, mask_all, n_pts):
-        overlay = bgr.copy()
-        overlay[mask_white  > 0] = (255, 255, 255)   # white channel → white
-        overlay[mask_yellow > 0] = (0,   200, 255)   # yellow channel → cyan
-
-        cv2.putText(overlay, f'wall pts={n_pts}',
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(overlay, f'W:{mask_white.sum()//255} Y:{mask_yellow.sum()//255}',
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 1)
-        cv2.imshow('Virtual Wall Debug', overlay)
-        cv2.waitKey(1)
+    @staticmethod
+    def _mask_to_pixels(mask):
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            return np.zeros((0, 2), dtype=np.float64)
+        return np.stack([xs, ys], axis=1).astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
 def main(args=None):
     rclpy.init(args=args)
-    node = VirtualWallNode()
+    node = LaneFilterNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -298,7 +292,6 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-        cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':

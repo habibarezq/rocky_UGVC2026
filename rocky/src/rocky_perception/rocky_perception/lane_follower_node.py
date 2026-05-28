@@ -3,23 +3,21 @@
 Lane Follower Node  (Vision-Aware + Curve-Safe)
 ================================================
 Drives the robot forward by computing the geometric centre between the
-left (yellow) and right (white) virtual-wall point clouds.
+left (yellow) and right (white) virtual-wall point clouds published by
+the lane_filter_node.
 
-Fixes in this version
----------------------
+Key design points
+-----------------
   * Preemption vs genuine failure distinguished via _intentional_cancel flag.
-    Nav2 always returns STATUS_ABORTED (6) when a goal is preempted by a new
-    one — previously this triggered a 2-second cooldown on EVERY goal update.
-    Now only genuine Nav2 failures (no progress, planner error) trigger it.
+    Nav2 returns STATUS_ABORTED (6) both when a goal is preempted by a new one
+    AND on genuine failure.  We set the flag before every intentional cancel so
+    genuine failures can trigger the abort cooldown while preemptions do not.
 
-  * Goal update rate reduced to 0.5 s and dedup threshold raised to 0.30 m.
-    This drastically reduces preemptions — the robot now follows a goal for
-    longer before it is replaced, giving the controller time to actually move.
+  * Goal update rate: 0.5 s timer with a dedup threshold (_update_dist).
+    The goal is only replaced when the lane centre has shifted more than this
+    threshold OR the previous goal succeeded/failed.
 
-  * Goal is only replaced when it has moved > 0.30 m OR the previous goal
-    succeeded/failed (not just "we've been waiting 0.3 s").
-
-  * Multi-slice centroid + adaptive lookahead on curves unchanged from v2.
+  * Multi-slice centroid + adaptive lookahead on curves.
 """
 
 import math
@@ -30,7 +28,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 import tf2_ros
-import tf2_geometry_msgs
+import tf2_geometry_msgs          # noqa: F401  — registers TF2 transforms
 from tf2_ros import TransformException
 from geometry_msgs.msg import PoseStamped, PointStamped
 from sensor_msgs.msg import PointCloud2
@@ -39,16 +37,16 @@ from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 
 
-def quaternion_from_euler(roll, pitch, yaw):
+def quaternion_from_euler(roll: float, pitch: float, yaw: float):
     cy = math.cos(yaw * 0.5);  sy = math.sin(yaw * 0.5)
     cp = math.cos(pitch * 0.5); sp = math.sin(pitch * 0.5)
     cr = math.cos(roll * 0.5);  sr = math.sin(roll * 0.5)
-    return [
+    return (
         cy * cp * cr + sy * sp * sr,   # w
         cy * cp * sr - sy * sp * cr,   # x
         sy * cp * sr + cy * sp * cr,   # y
         sy * cp * cr - cy * sp * sr,   # z
-    ]
+    )
 
 
 class LaneFollowerNode(Node):
@@ -56,19 +54,23 @@ class LaneFollowerNode(Node):
     def __init__(self):
         super().__init__('lane_follower_node')
 
-        # Parameters -------------------------------------------------------
-        self.declare_parameter('lookahead_distance',  1.5)
-        self.declare_parameter('lookahead_step',      0.5)
-        self.declare_parameter('slice_tolerance',     0.25)
-        self.declare_parameter('min_remaining_dist',  0.7) # was 0.4
-        self.declare_parameter('startup_delay_sec',   0.0)
+        # ------------------------------------------------------------------
+        # Parameters
+        # ------------------------------------------------------------------
+        self.declare_parameter('lookahead_distance',   1.5)
+        self.declare_parameter('lookahead_step',       0.5)
+        self.declare_parameter('slice_tolerance',      0.25)
+        self.declare_parameter('min_remaining_dist',   0.7)
+        self.declare_parameter('startup_delay_sec',    0.0)
         self.declare_parameter('nav_goal_timeout',    30.0)
-        self.declare_parameter('abort_cooldown_sec',  2.0)
-        self.declare_parameter('lane_width',          0.75)
-        self.declare_parameter('curve_detect_thresh', 0.08) # was 0.12
-        self.declare_parameter('curve_lookahead',     0.4) #was 0.8
-        # Goal is only replaced when it shifts more than this (m)
-        self.declare_parameter('goal_update_dist',    0.30)
+        self.declare_parameter('abort_cooldown_sec',   2.0)
+        self.declare_parameter('lane_width',           0.75)
+        self.declare_parameter('curve_detect_thresh',  0.08)
+        self.declare_parameter('curve_lookahead',      0.4)
+        self.declare_parameter('goal_update_dist',     0.30)
+        # Topics
+        self.declare_parameter('left_cloud_topic',  '/virtual_walls/left')
+        self.declare_parameter('right_cloud_topic', '/virtual_walls/right')
 
         self._lookahead       = self.get_parameter('lookahead_distance').value
         self._step            = self.get_parameter('lookahead_step').value
@@ -82,52 +84,63 @@ class LaneFollowerNode(Node):
         self._curve_lookahead = self.get_parameter('curve_lookahead').value
         self._update_dist     = self.get_parameter('goal_update_dist').value
 
+        # ------------------------------------------------------------------
         # TF
+        # ------------------------------------------------------------------
         self._tf_buf = tf2_ros.Buffer()
         self._tf_lis = tf2_ros.TransformListener(self._tf_buf, self)
 
+        # ------------------------------------------------------------------
         # Nav2 action client
+        # ------------------------------------------------------------------
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
 
+        # ------------------------------------------------------------------
         # Vision subscriptions
+        # ------------------------------------------------------------------
         self._left_pts  = np.empty((0, 3), dtype=np.float32)
         self._right_pts = np.empty((0, 3), dtype=np.float32)
-        self.create_subscription(PointCloud2, '/virtual_walls/left',  self._left_cb,  5)
-        self.create_subscription(PointCloud2, '/virtual_walls/right', self._right_cb, 5)
 
-        # State
-        self._goal_handle       = None
-        self._goal_active       = False
-        self._current_goal      = None
-        self._goal_sent_at      = None
-        self._last_abort_at     = None
-        self._started           = False
-        self._start_wall        = self.get_clock().now()
+        left_topic  = self.get_parameter('left_cloud_topic').value
+        right_topic = self.get_parameter('right_cloud_topic').value
 
-        # ---------------------------------------------------------------
-        # KEY FIX: track intentional cancellations so preempted goals
-        # don't trigger the abort cooldown.
-        # ---------------------------------------------------------------
+        self.create_subscription(PointCloud2, left_topic,  self._left_cb,  5)
+        self.create_subscription(PointCloud2, right_topic, self._right_cb, 5)
+
+        # ------------------------------------------------------------------
+        # Internal state
+        # ------------------------------------------------------------------
+        self._goal_handle        = None
+        self._goal_active        = False
+        self._current_goal       = None
+        self._goal_sent_at       = None
+        self._last_abort_at      = None
+        self._started            = False
+        self._start_wall         = self.get_clock().now()
         self._intentional_cancel = False
-        self._pending_goal_id = None
+        self._pending_goal_id    = None
 
-        # 0.5 s loop — slower than v2's 0.3 s to reduce preemption spam
+        # ------------------------------------------------------------------
+        # Main loop timer — 0.5 s
+        # ------------------------------------------------------------------
         self._timer = self.create_timer(0.5, self._loop)
 
-        self.get_logger().info('Vision-Aware Lane Follower Initialized.')
+        self.get_logger().info(
+            f'LaneFollowerNode ready  left=[{left_topic}]  right=[{right_topic}]')
 
     # ------------------------------------------------------------------
     # Point-cloud callbacks
     # ------------------------------------------------------------------
-    def _left_cb(self, msg):
+    def _left_cb(self, msg: PointCloud2):
         self._left_pts = self._unpack_cloud(msg)
 
-    def _right_cb(self, msg):
+    def _right_cb(self, msg: PointCloud2):
         self._right_pts = self._unpack_cloud(msg)
 
     @staticmethod
-    def _unpack_cloud(msg) -> np.ndarray:
-        pts = list(point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True))
+    def _unpack_cloud(msg: PointCloud2) -> np.ndarray:
+        pts = list(point_cloud2.read_points(
+            msg, field_names=('x', 'y', 'z'), skip_nans=True))
         if pts:
             return np.array([[p[0], p[1], p[2]] for p in pts], dtype=np.float32)
         return np.empty((0, 3), dtype=np.float32)
@@ -136,16 +149,17 @@ class LaneFollowerNode(Node):
     # Main loop
     # ------------------------------------------------------------------
     def _loop(self):
-        if self._startup_sec > 0:
+        # Startup delay
+        if self._startup_sec > 0 and not self._started:
             elapsed = (self.get_clock().now() - self._start_wall).nanoseconds / 1e9
             if elapsed < self._startup_sec:
                 return
 
         if not self._started:
             self._started = True
-            self.get_logger().info('Starting Dynamic Vision Tracking!')
+            self.get_logger().info('Lane follower starting dynamic tracking!')
 
-        # Genuine abort cooldown (not triggered by preemption)
+        # Genuine abort cooldown
         if self._last_abort_at is not None:
             since = (self.get_clock().now() - self._last_abort_at).nanoseconds / 1e9
             if since < self._abort_cooldown:
@@ -163,19 +177,16 @@ class LaneFollowerNode(Node):
                 self._cancel_goal_intentionally()
 
         if not self._goal_active or self._close_to_goal(tf):
-            # No active goal or robot reached current one — always send new goal
             goal = self._compute_vision_goal(tf)
             if goal:
                 self._send_goal(goal)
         else:
-            # Goal is active and robot is still far — only update if the
-            # lane centre has shifted significantly
             goal = self._compute_vision_goal(tf)
             if goal and self._goal_shifted_enough(goal):
                 self._send_goal(goal)
 
     # ------------------------------------------------------------------
-    # Goal computation — multi-slice centroid (same as v2)
+    # Goal computation — multi-slice centroid with adaptive lookahead
     # ------------------------------------------------------------------
     def _compute_vision_goal(self, tf) -> PoseStamped:
         slices   = np.arange(self._step, self._lookahead + self._step * 0.5, self._step)
@@ -211,12 +222,14 @@ class LaneFollowerNode(Node):
                 best_cx = rx - self._lane_width / 2.0
 
         if best_z is None or best_cx is None:
-            self.get_logger().warn('No lane points — blind fallback.',
-                                   throttle_duration_sec=3.0)
+            self.get_logger().warn(
+                'No lane points visible — blind fallback.',
+                throttle_duration_sec=3.0)
             return self._compute_blind_goal(tf)
 
         best_cx = float(np.clip(best_cx, -self._lane_width * 0.6, self._lane_width * 0.6))
 
+        # Build a PointStamped in camera frame, then transform to map
         pt_cam = PointStamped()
         pt_cam.header.frame_id = 'camera_link_optical'
         pt_cam.header.stamp    = rclpy.time.Time().to_msg()
@@ -225,27 +238,30 @@ class LaneFollowerNode(Node):
         pt_cam.point.z = float(best_z)
 
         try:
-            pt_map = self._tf_buf.transform(pt_cam, 'map', timeout=Duration(seconds=0.5))
+            pt_map = self._tf_buf.transform(
+                pt_cam, 'map', timeout=Duration(seconds=0.5))
         except TransformException as exc:
-            self.get_logger().warn(f'TF failed: {exc} — blind fallback.',
-                                   throttle_duration_sec=3.0)
+            self.get_logger().warn(
+                f'TF failed: {exc} — blind fallback.',
+                throttle_duration_sec=3.0)
             return self._compute_blind_goal(tf)
 
         robot_x = tf.transform.translation.x
         robot_y = tf.transform.translation.y
-        yaw = math.atan2(pt_map.point.y - robot_y, pt_map.point.x - robot_x)
-        q   = quaternion_from_euler(0, 0, yaw)
+        yaw = math.atan2(pt_map.point.y - robot_y,
+                         pt_map.point.x - robot_x)
+        q   = quaternion_from_euler(0.0, 0.0, yaw)
 
         pose = PoseStamped()
-        pose.header.frame_id       = 'map'
-        pose.header.stamp          = self.get_clock().now().to_msg()
-        pose.pose.position.x       = pt_map.point.x
-        pose.pose.position.y       = pt_map.point.y
-        pose.pose.position.z       = 0.0
-        pose.pose.orientation.w    = q[0]
-        pose.pose.orientation.x    = q[1]
-        pose.pose.orientation.y    = q[2]
-        pose.pose.orientation.z    = q[3]
+        pose.header.frame_id      = 'map'
+        pose.header.stamp         = self.get_clock().now().to_msg()
+        pose.pose.position.x      = pt_map.point.x
+        pose.pose.position.y      = pt_map.point.y
+        pose.pose.position.z      = 0.0
+        pose.pose.orientation.w   = q[0]
+        pose.pose.orientation.x   = q[1]
+        pose.pose.orientation.y   = q[2]
+        pose.pose.orientation.z   = q[3]
         return pose
 
     # ------------------------------------------------------------------
@@ -264,13 +280,13 @@ class LaneFollowerNode(Node):
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         pose = PoseStamped()
-        pose.header.frame_id   = 'map'
-        pose.header.stamp      = self.get_clock().now().to_msg()
-        blind_dist = self._curve_lookahead * 0.4
-        pose.pose.position.x = x + blind_dist * math.cos(yaw)
-        pose.pose.position.y = y + blind_dist * math.sin(yaw)
-        pose.pose.position.z   = 0.0
-        pose.pose.orientation  = q
+        pose.header.frame_id = 'map'
+        pose.header.stamp    = self.get_clock().now().to_msg()
+        d = self._curve_lookahead * 0.4
+        pose.pose.position.x  = x + d * math.cos(yaw)
+        pose.pose.position.y  = y + d * math.sin(yaw)
+        pose.pose.position.z  = 0.0
+        pose.pose.orientation = q
         return pose
 
     # ------------------------------------------------------------------
@@ -284,7 +300,6 @@ class LaneFollowerNode(Node):
         return math.hypot(dx, dy) < self._min_dist
 
     def _goal_shifted_enough(self, new_pose: PoseStamped) -> bool:
-        """Only replace goal if lane centre has moved more than _update_dist."""
         if self._current_goal is None:
             return True
         dx = new_pose.pose.position.x - self._current_goal.pose.position.x
@@ -294,32 +309,36 @@ class LaneFollowerNode(Node):
     def _get_robot_tf(self):
         try:
             return self._tf_buf.lookup_transform(
-                'map', 'base_footprint', rclpy.time.Time(),
+                'map', 'base_footprint',
+                rclpy.time.Time(),
                 timeout=Duration(seconds=0.2))
         except TransformException:
             return None
 
     def _send_goal(self, pose: PoseStamped):
         if not self._nav_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn('Nav2 action server not available.')
             return
-        # Cancel the current goal INTENTIONALLY before sending the new one
+
+        # Cancel old goal intentionally before sending a new one
         self._cancel_goal_intentionally()
 
-        goal_msg = NavigateToPose.Goal()
+        goal_msg      = NavigateToPose.Goal()
         goal_msg.pose = pose
 
         self.get_logger().info(
-            f'🎯 Vision Goal: ({pose.pose.position.x:.2f}, {pose.pose.position.y:.2f})')
+            f'Goal → ({pose.pose.position.x:.2f}, {pose.pose.position.y:.2f})')
 
         self._pending_goal_id = str(uuid.uuid4())
         future = self._nav_client.send_goal_async(goal_msg)
         future.add_done_callback(
-    lambda f, gid=self._pending_goal_id: self._on_goal_accepted(f, gid))
+            lambda f, gid=self._pending_goal_id: self._on_goal_accepted(f, gid))
+
         self._goal_active  = True
         self._current_goal = pose
         self._goal_sent_at = self.get_clock().now()
 
-    def _on_goal_accepted(self, future, goal_id):
+    def _on_goal_accepted(self, future, goal_id: str):
         handle = future.result()
         if not handle.accepted:
             self.get_logger().warn('Goal rejected by Nav2.')
@@ -329,47 +348,44 @@ class LaneFollowerNode(Node):
         handle.get_result_async().add_done_callback(
             lambda f: self._on_result(f, goal_id))
 
-    def _on_result(self, future, goal_id):
+    def _on_result(self, future, goal_id: str):
         """
-        Called when a goal finishes.
-
         STATUS_SUCCEEDED (4) → normal success
-        STATUS_CANCELED  (5) → we cancelled it — no cooldown
-        STATUS_ABORTED   (6) → Nav2 preempted it (new goal sent) OR genuine failure
-
-        If _intentional_cancel is set we know we triggered the cancel — skip cooldown.
-        Otherwise it is a genuine Nav2 failure (stuck, planner error) → cooldown.
+        STATUS_CANCELED  (5) → we cancelled it intentionally
+        STATUS_ABORTED   (6) → Nav2 preempted it (new goal) OR genuine failure
         """
         if goal_id != self._pending_goal_id:
+            # Stale result from an old goal — ignore
             return
+
         if self._intentional_cancel:
-            # We cancelled it on purpose to send a new goal — not a failure
+            # We triggered the cancel to send a new goal — not a failure
             self._intentional_cancel = False
-            self._goal_active = False
-            self._goal_handle = None
+            self._goal_active  = False
+            self._goal_handle  = None
             return
 
         status = future.result().status
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().debug('Goal succeeded.')
         elif status == GoalStatus.STATUS_CANCELED:
-            pass   # normal cancel
+            pass
         else:
-            # Genuine Nav2 failure — back off and wait
+            # Genuine Nav2 failure — apply cooldown
             self.get_logger().warn(
-                f'Goal genuinely failed (status={status}) — cooldown {self._abort_cooldown}s.')
+                f'Goal genuinely failed (status={status}) '
+                f'— cooldown {self._abort_cooldown}s.')
             self._last_abort_at = self.get_clock().now()
 
         self._goal_active = False
         self._goal_handle = None
 
     def _cancel_goal_intentionally(self):
-        """Cancel the current goal and flag it as intentional (not a failure)."""
+        """Cancel the current goal and mark it as intentional (not a failure)."""
         if self._goal_handle is not None:
             self._intentional_cancel = True
             self._goal_handle.cancel_goal_async()
             self._goal_handle = None
-        # self._goal_active = False
 
 
 # ---------------------------------------------------------------------------

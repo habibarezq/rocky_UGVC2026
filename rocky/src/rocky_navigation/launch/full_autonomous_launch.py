@@ -212,7 +212,7 @@ def generate_launch_description():
         # localization,
         nav2_launch,
         virtual_wall_node,
-        lane_follower,
+        # lane_follower,
         rviz,            # ← now uses shared rviz.launch.py
         twist_stamper,
     ])
